@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Make the splash background transparent so Flutter UI shows through -->
+<layer-list xmlns:android="http://schemas.android.com/apk/res/android">
+    <!-- Use transparent background -->
+    <item android:drawable="@android:color/transparent" />
+
+    <!-- Optional: keep a centered launch image if you want an overlay
+         <item>
+            <bitmap
+                android:gravity="center"
+                android:src="@mipmap/launch_image" />
+        </item>
+    -->
+</layer-list>
+
+
