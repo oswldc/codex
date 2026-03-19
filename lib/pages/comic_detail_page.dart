@@ -1,3 +1,4 @@
+import 'dart:io';
 import 'dart:ui';
 import 'package:flutter/material.dart';
 import 'package:cached_network_image/cached_network_image.dart';
@@ -80,7 +81,12 @@ class _ComicDetailPageState extends State<ComicDetailPage> {
                       borderRadius: BorderRadius.circular(16),
                       child:
                           (_currentComic.source == ComicSource.local &&
-                                  _currentComic.coverBytes != null)
+                                  _currentComic.thumbnailPath != null)
+                              ? Image.file(
+                                File(_currentComic.thumbnailPath!),
+                                fit: BoxFit.cover,
+                              )
+                              : (_currentComic.coverBytes != null)
                               ? Image.memory(
                                 _currentComic.coverBytes!,
                                 fit: BoxFit.cover,
@@ -102,11 +108,7 @@ class _ComicDetailPageState extends State<ComicDetailPage> {
                               )
                               : Container(
                                 color: Colors.white10,
-                                child: const Icon(
-                                  Icons.book,
-                                  size: 48,
-                                  color: Colors.white24,
-                                ),
+                                child: const Icon(Icons.book, size: 48),
                               ),
                     ),
                   ),
@@ -183,6 +185,18 @@ class _ComicDetailPageState extends State<ComicDetailPage> {
                           fontSize: 32,
                           fontWeight: FontWeight.bold,
                           height: 1.1,
+                          shadows: [
+                            Shadow(
+                              color: Colors.black87,
+                              blurRadius: 12,
+                              offset: Offset(0, 2),
+                            ),
+                            Shadow(
+                              color: Colors.black54,
+                              blurRadius: 24,
+                              offset: Offset(0, 4),
+                            ),
+                          ],
                         ),
                       ),
                       const SizedBox(height: 8),
@@ -319,11 +333,17 @@ class _ComicDetailPageState extends State<ComicDetailPage> {
               child: Column(
                 mainAxisSize: MainAxisSize.min,
                 children: [
-                  ClipRRect(
-                    borderRadius: BorderRadius.circular(4),
+                  // Progress Bar - fixed dengan Container + clipBehavior
+                  Container(
+                    height: 4,
+                    clipBehavior: Clip.hardEdge,
+                    decoration: BoxDecoration(
+                      borderRadius: BorderRadius.circular(10),
+                      color: Colors.white10,
+                    ),
                     child: LinearProgressIndicator(
                       value: _currentComic.progress,
-                      backgroundColor: Colors.white10,
+                      backgroundColor: Colors.transparent,
                       valueColor: AlwaysStoppedAnimation(primaryColor),
                       minHeight: 4,
                     ),

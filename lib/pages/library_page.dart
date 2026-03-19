@@ -1,3 +1,4 @@
+import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:cached_network_image/cached_network_image.dart';
 import '../models/comic.dart';
@@ -34,23 +35,25 @@ class _LibraryPageState extends State<LibraryPage> {
   }
 
   Future<void> _deleteComic(Comic comic) async {
-    final confirm = await showDialog<bool>(
+    final result = await showDialog<String>(
       context: context,
       builder:
           (context) => AlertDialog(
             title: const Text('Delete Comic'),
-            content: Text(
-              'Are you sure you want to delete "${comic.title}"? This will also delete the physical file.',
-            ),
+            content: Text('What do you want to do with "${comic.title}"?'),
             actions: [
               TextButton(
-                onPressed: () => Navigator.pop(context, false),
+                onPressed: () => Navigator.pop(context, 'cancel'),
                 child: const Text('Cancel'),
               ),
               TextButton(
-                onPressed: () => Navigator.pop(context, true),
+                onPressed: () => Navigator.pop(context, 'library'),
+                child: const Text('Only remove from library'),
+              ),
+              TextButton(
+                onPressed: () => Navigator.pop(context, 'delete'),
                 child: const Text(
-                  'Delete',
+                  'Delete file',
                   style: TextStyle(color: Colors.redAccent),
                 ),
               ),
@@ -58,10 +61,13 @@ class _LibraryPageState extends State<LibraryPage> {
           ),
     );
 
-    if (confirm == true) {
-      await ComicService.deleteComic(comic);
-      _loadSavedComics();
+    if (result == 'library') {
+      await ComicService.deleteComic(comic, deleteFile: false);
+    } else if (result == 'delete') {
+      await ComicService.deleteComic(comic, deleteFile: true);
     }
+
+    _loadSavedComics();
   }
 
   Future<void> _addLocalComics() async {
@@ -230,10 +236,11 @@ class _LibraryPageState extends State<LibraryPage> {
                               mainAxisAlignment: MainAxisAlignment.center,
                               children: [
                                 Icon(
-                                  Icons.library_books,
-                                  size: 64,
+                                  Icons.menu_book,
+                                  size: 128,
                                   color: Colors.white10,
                                 ),
+                                const SizedBox(height: 12),
                                 ElevatedButton(
                                   onPressed: _addLocalComics,
                                   style: ElevatedButton.styleFrom(
@@ -382,13 +389,16 @@ class ComicCard extends StatelessWidget {
                 ],
               ),
               child: ClipRRect(
-                borderRadius: BorderRadius.circular(12),
+                borderRadius: BorderRadius.circular(10),
                 child: Stack(
                   fit: StackFit.expand,
                   children: [
                     comic.source == ComicSource.local &&
-                            comic.coverBytes != null
-                        ? Image.memory(comic.coverBytes!, fit: BoxFit.cover)
+                            comic.thumbnailPath != null
+                        ? Image.file(
+                          File(comic.thumbnailPath!),
+                          fit: BoxFit.cover,
+                        )
                         : comic.imageUrl.isNotEmpty
                         ? CachedNetworkImage(
                           imageUrl: comic.imageUrl,

@@ -25,6 +25,7 @@ class Comic {
   final int? lastRead; // Timestamp for sorting recent comics
   final int? currentPage;
   final int? totalPages;
+  final String? thumbnailPath;
 
   Comic({
     required this.id,
@@ -32,6 +33,7 @@ class Comic {
     required this.subtitle,
     required this.imageUrl,
     this.coverBytes,
+    this.thumbnailPath,
     required this.progress,
     required this.genre,
     this.publisher,
@@ -54,7 +56,8 @@ class Comic {
       'title': title,
       'subtitle': subtitle,
       'imageUrl': imageUrl,
-      'coverBytes': coverBytes != null ? base64Encode(coverBytes!) : null,
+      'coverBytes': null,
+      'thumbnailPath': thumbnailPath,
       'progress': progress,
       'genre': genre,
       'publisher': publisher,
@@ -80,6 +83,7 @@ class Comic {
       imageUrl: json['imageUrl'] ?? '',
       coverBytes:
           json['coverBytes'] != null ? base64Decode(json['coverBytes']) : null,
+      thumbnailPath: json['thumbnailPath'],
       progress: (json['progress'] as num?)?.toDouble() ?? 0.0,
       genre: json['genre'] ?? '',
       publisher: json['publisher'],

@@ -12,114 +12,167 @@ class ComicService {
   static const String _comicsKey = 'saved_comics';
   static const String _externalLibraryKey = 'external_library_path';
 
-  static Future<List<Comic>> pickAndParseComics() async {
-    try {
-      debugPrint('ComicService: Calling file picker...');
-      FilePickerResult? result = await FilePicker.platform.pickFiles(
-        allowMultiple: true,
-        type: FileType.custom,
-        allowedExtensions: ['cbz', 'cbr', 'pdf', 'zip', 'rar', 'tar'],
-        withData: false,
-      );
+  /// =========================
+  /// THUMBNAIL PATH
+  /// =========================
+  static Future<String> getThumbnailPath(String fileName) async {
+    final appDir = await getApplicationDocumentsDirectory();
+    final thumbDir = Directory(p.join(appDir.path, 'thumbnails'));
 
-      if (result == null) {
-        debugPrint('ComicService: Picker returned null (cancelled)');
-        return [];
-      }
-
-      // Get permanent directory for storage
-      final appDir = await getApplicationDocumentsDirectory();
-      final libraryDir = Directory(p.join(appDir.path, 'my_library'));
-      if (!libraryDir.existsSync()) {
-        await libraryDir.create(recursive: true);
-      }
-
-      List<Comic> comics = [];
-      for (var file in result.files) {
-        if (file.path == null) continue;
-
-        // Copy file to permanent storage
-        final permanentPath = p.normalize(p.join(libraryDir.path, file.name));
-        final pickedFile = File(file.path!);
-
-        debugPrint(
-          'ComicService: Copying file to permanent storage: $permanentPath',
-        );
-        final permanentFile = await pickedFile.copy(permanentPath);
-
-        final extension = p.extension(file.name).toLowerCase();
-        final name = p.basenameWithoutExtension(file.name);
-
-        ComicFileType type = ComicFileType.unknown;
-        if (extension == '.cbz' || extension == '.zip') {
-          type = ComicFileType.cbz;
-        } else if (extension == '.cbr' || extension == '.rar') {
-          type = ComicFileType.cbr;
-        } else if (extension == '.pdf') {
-          type = ComicFileType.pdf;
-        }
-
-        Uint8List? thumbnail;
-        try {
-          if (type == ComicFileType.cbz) {
-            thumbnail = await compute(_extractFirstCBZPage, permanentFile.path);
-          }
-        } catch (e) {
-          debugPrint('Thumbnail extraction error: $e');
-        }
-
-        comics.add(
-          Comic(
-            id: DateTime.now().millisecondsSinceEpoch.toString() + file.name,
-            title: name,
-            subtitle: type.toString().split('.').last.toUpperCase(),
-            imageUrl: '',
-            coverBytes: thumbnail,
-            progress: 0.0,
-            genre: 'Local File',
-            localPath: permanentFile.path,
-            source: ComicSource.local,
-            fileType: type,
-            description: 'Local comic file: ${file.name}',
-          ),
-        );
-      }
-      return comics;
-    } catch (e) {
-      debugPrint('ComicService Error: $e');
-      rethrow;
+    if (!thumbDir.existsSync()) {
+      await thumbDir.create(recursive: true);
     }
+    return p.join(thumbDir.path, '$fileName.jpg');
   }
 
+  /// =========================
+  /// PICK FILE (NO COPY)
+  /// =========================
+  static Future<List<Comic>> pickAndParseComics() async {
+    FilePickerResult? result = await FilePicker.platform.pickFiles(
+      allowMultiple: true,
+      type: FileType.custom,
+      allowedExtensions: ['cbz', 'cbr', 'pdf', 'zip', 'rar', 'tar'],
+    );
+
+    if (result == null) return [];
+
+    List<Comic> comics = [];
+
+    for (var file in result.files) {
+      if (file.path == null) continue;
+
+      final originalPath = file.path!;
+      final extension = p.extension(file.name).toLowerCase();
+      final name = p.basenameWithoutExtension(file.name);
+
+      ComicFileType type = ComicFileType.unknown;
+      if (extension == '.cbz' || extension == '.zip') {
+        type = ComicFileType.cbz;
+      } else if (extension == '.cbr' || extension == '.rar') {
+        type = ComicFileType.cbr;
+      } else if (extension == '.pdf') {
+        type = ComicFileType.pdf;
+      }
+
+      Uint8List? thumbnail;
+      String? thumbnailPath;
+
+      if (type == ComicFileType.cbz) {
+        thumbnail = await compute(_extractFirstCBZPage, originalPath);
+
+        if (thumbnail != null) {
+          thumbnailPath = await getThumbnailPath(file.name);
+          await File(thumbnailPath).writeAsBytes(thumbnail);
+        }
+      }
+
+      comics.add(
+        Comic(
+          id: DateTime.now().millisecondsSinceEpoch.toString() + file.name,
+          title: name,
+          subtitle: type.name.toUpperCase(),
+          imageUrl: '',
+          coverBytes: null, // ❌ tidak simpan di memory lagi
+          thumbnailPath: thumbnailPath, // ✅ pakai file
+          progress: 0.0,
+          genre: 'Local File',
+          localPath: originalPath,
+          source: ComicSource.local,
+          fileType: type,
+          description: 'Local comic file: ${file.name}',
+        ),
+      );
+    }
+
+    final existing = await loadComics();
+    final updated = [...existing, ...comics];
+    await saveComics(updated);
+
+    return comics;
+  }
+
+  /// =========================
+  /// SAVE & LOAD
+  /// =========================
   static Future<void> saveComics(List<Comic> comics) async {
     final prefs = await SharedPreferences.getInstance();
-    final String encodedData = jsonEncode(
-      comics.map((comic) => comic.toJson()).toList(),
-    );
-    await prefs.setString(_comicsKey, encodedData);
+    final data = jsonEncode(comics.map((c) => c.toJson()).toList());
+    await prefs.setString(_comicsKey, data);
   }
 
   static Future<List<Comic>> loadComics() async {
     final prefs = await SharedPreferences.getInstance();
-    final String? comicsJson = prefs.getString(_comicsKey);
-    if (comicsJson == null) return [];
+    final jsonStr = prefs.getString(_comicsKey);
+
+    if (jsonStr == null) return [];
 
     try {
-      final List<dynamic> decodedData = jsonDecode(comicsJson);
-      return decodedData.map((json) => Comic.fromJson(json)).toList();
+      final List decoded = jsonDecode(jsonStr);
+      return decoded.map((e) => Comic.fromJson(e)).toList();
     } catch (e) {
-      debugPrint('Error loading comics: $e');
+      debugPrint('Load error: $e');
       return [];
     }
   }
 
-  static Future<String> getLibraryPath() async {
-    final appDir = await getApplicationDocumentsDirectory();
-    final libraryDir = Directory(p.join(appDir.path, 'my_library'));
-    if (!libraryDir.existsSync()) {
-      await libraryDir.create(recursive: true);
+  /// =========================
+  /// REMOVE (SAFE)
+  /// =========================
+  static Future<void> removeFromLibrary(Comic comic) async {
+    final comics = await loadComics();
+    final updated = comics.where((c) => c.id != comic.id).toList();
+    await saveComics(updated);
+
+    // delete thumbnail only
+    if (comic.thumbnailPath != null) {
+      final file = File(comic.thumbnailPath!);
+      if (file.existsSync()) {
+        await file.delete();
+      }
     }
-    return libraryDir.path;
+  }
+
+  /// =========================
+  /// DELETE (FULL)
+  /// =========================
+  static Future<void> deleteComic(
+    Comic comic, {
+    bool deleteFile = false,
+  }) async {
+    final comics = await loadComics();
+    final updatedComics = comics.where((c) => c.id != comic.id).toList();
+    await saveComics(updatedComics);
+
+    // ✅ delete thumbnail
+    if (comic.thumbnailPath != null) {
+      final thumb = File(comic.thumbnailPath!);
+      if (thumb.existsSync()) {
+        await thumb.delete();
+      }
+    }
+
+    // ✅ optional delete file
+    if (deleteFile && comic.localPath != null) {
+      final file = File(comic.localPath!);
+      if (file.existsSync()) {
+        await file.delete();
+      }
+    }
+  }
+
+  /// =========================
+  /// EXTERNAL LIBRARY
+  /// =========================
+  static Future<String?> pickLibraryDirectory() async {
+    final dir = await FilePicker.platform.getDirectoryPath();
+
+    if (dir != null) {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setString(_externalLibraryKey, dir);
+    }
+
+    return dir;
   }
 
   static Future<String?> getExternalLibraryPath() async {
@@ -127,218 +180,94 @@ class ComicService {
     return prefs.getString(_externalLibraryKey);
   }
 
-  static Future<String?> pickLibraryDirectory() async {
-    try {
-      String? selectedDirectory = await FilePicker.platform.getDirectoryPath();
-
-      if (selectedDirectory != null) {
-        // Create .ini file as a marker (try-catch because of Scoped Storage)
-        try {
-          final iniFile = File(p.join(selectedDirectory, 'codex_library.ini'));
-          if (!iniFile.existsSync()) {
-            await iniFile.writeAsString(
-              '[Codex]\ndirectory_type=library\ncreated_at=${DateTime.now().toIso8601String()}',
-            );
-          }
-        } catch (e) {
-          debugPrint(
-            'ComicService: Could not write .ini marker (expected on Android 11+): $e',
-          );
-          // We continue anyway, as the path is stored in SharedPreferences
-        }
-
-        // Save to SharedPreferences
-        final prefs = await SharedPreferences.getInstance();
-        await prefs.setString(_externalLibraryKey, selectedDirectory);
-
-        return selectedDirectory;
-      }
-      return null;
-    } catch (e) {
-      debugPrint('ComicService pickLibraryDirectory Error: $e');
-      return null;
-    }
-  }
-
-  static Future<void> deleteComic(Comic comic) async {
-    final comics = await loadComics();
-    final updatedComics = comics.where((c) => c.id != comic.id).toList();
-    await saveComics(updatedComics);
-
-    // Also delete the physical file if it exists in our internal library
-    if (comic.localPath != null) {
-      final file = File(comic.localPath!);
-      if (file.existsSync()) {
-        try {
-          await file.delete();
-          debugPrint('ComicService: Deleted file ${file.path}');
-        } catch (e) {
-          debugPrint('ComicService: Error deleting file: $e');
-        }
-      }
-    }
-  }
-
-  /// Scans library folders and syncs with SharedPreferences
+  /// =========================
+  /// SYNC FOLDER
+  /// =========================
   static Future<List<Comic>> syncWithFolder() async {
-    final internalPath = await getLibraryPath();
     final externalPath = await getExternalLibraryPath();
+    final existing = await loadComics();
 
-    debugPrint('ComicService: Starting sync...');
-    debugPrint('ComicService: Internal path: $internalPath');
-    debugPrint('ComicService: External path: $externalPath');
-
-    final existingComics = await loadComics();
-    debugPrint('ComicService: Existing comics in DB: ${existingComics.length}');
-
-    List<Comic> updatedList = List.from(existingComics);
+    List<Comic> updated = List.from(existing);
     bool changed = false;
 
-    // Scan internal folder
-    changed |= await _scanAndAddFromDir(
-      internalPath,
-      existingComics,
-      updatedList,
-    );
-
-    // Scan external folder if exists
     if (externalPath != null) {
-      final externalDir = Directory(externalPath);
-      if (externalDir.existsSync()) {
-        changed |= await _scanAndAddFromDir(
-          externalPath,
-          existingComics,
-          updatedList,
-        );
-      } else {
-        debugPrint(
-          'ComicService: External library directory not found: $externalPath',
-        );
-      }
+      changed |= await _scanDir(externalPath, updated);
     }
 
-    // Also remove entries from SharedPreferences if file no longer exists
-    final List<Comic> finalList = [];
-    for (var comic in updatedList) {
-      if (comic.localPath != null) {
-        final normalizedPath = p.normalize(comic.localPath!);
-        if (File(normalizedPath).existsSync()) {
-          finalList.add(comic);
-        } else {
-          changed = true;
-          debugPrint(
-            'ComicService: File no longer exists, removing from library: ${comic.title} at $normalizedPath',
-          );
-        }
-      } else {
-        // Network comics don't have localPath, keep them
-        finalList.add(comic);
-      }
-    }
+    // remove missing files
+    updated =
+        updated.where((comic) {
+          if (comic.localPath == null) return true;
+          return File(comic.localPath!).existsSync();
+        }).toList();
 
     if (changed) {
-      debugPrint('ComicService: Library changed, saving to SharedPreferences');
-      await saveComics(finalList);
-    } else {
-      debugPrint('ComicService: No changes in library');
+      await saveComics(updated);
     }
-    return finalList;
+
+    return updated;
   }
 
-  static Future<bool> _scanAndAddFromDir(
-    String dirPath,
-    List<Comic> existingComics,
-    List<Comic> updatedList,
-  ) async {
+  static Future<bool> _scanDir(String path, List<Comic> list) async {
     bool changed = false;
-    try {
-      final dir = Directory(dirPath);
-      if (!dir.existsSync()) {
-        debugPrint('ComicService: Directory does not exist: $dirPath');
-        return false;
-      }
 
-      debugPrint('ComicService: Scanning directory: $dirPath');
-      // Use recursive scan to find comics in subfolders
-      final List<FileSystemEntity> entities = dir.listSync(recursive: true);
-      debugPrint('ComicService: Found ${entities.length} entities in $dirPath');
+    final dir = Directory(path);
+    if (!dir.existsSync()) return false;
 
-      for (var entity in entities) {
-        final path = p.normalize(entity.path);
-        final fileName = p.basename(path);
-        debugPrint(
-          'ComicService: Processing entity: $path (isDir: ${entity is Directory})',
+    final files = dir.listSync(recursive: true);
+
+    for (var entity in files) {
+      if (entity is! File) continue;
+
+      final filePath = p.normalize(entity.path);
+      final fileName = p.basename(filePath);
+      final ext = p.extension(fileName).toLowerCase();
+
+      if (!['.cbz', '.cbr', '.pdf', '.zip', '.rar'].contains(ext)) continue;
+
+      final exists = list.any(
+        (c) => p.normalize(c.localPath ?? '') == filePath,
+      );
+
+      if (!exists) {
+        String? thumbnailPath;
+
+        if (ext == '.cbz' || ext == '.zip') {
+          try {
+            final thumb = await compute(_extractFirstCBZPage, filePath);
+            if (thumb != null) {
+              thumbnailPath = await getThumbnailPath(fileName);
+              await File(thumbnailPath).writeAsBytes(thumb);
+            }
+          } catch (_) {}
+        }
+
+        list.add(
+          Comic(
+            id: '${DateTime.now().millisecondsSinceEpoch}_${fileName.hashCode}',
+            title: p.basenameWithoutExtension(fileName),
+            subtitle: ext.replaceAll('.', '').toUpperCase(),
+            imageUrl: '',
+            coverBytes: null,
+            thumbnailPath: thumbnailPath,
+            progress: 0,
+            genre: 'Local File',
+            localPath: filePath,
+            source: ComicSource.local,
+            fileType: ComicFileType.cbz,
+          ),
         );
 
-        if (entity is File) {
-          final extension = p.extension(fileName).toLowerCase();
-
-          if (![
-            '.cbz',
-            '.cbr',
-            '.pdf',
-            '.zip',
-            '.rar',
-            '.tar',
-          ].contains(extension)) {
-            continue;
-          }
-
-          // Check if this file is already in our library (normalize paths for comparison)
-          bool alreadyExists = updatedList.any(
-            (c) => c.localPath != null && p.normalize(c.localPath!) == path,
-          );
-
-          if (!alreadyExists) {
-            debugPrint(
-              'ComicService: Found new file: $fileName, adding to library...',
-            );
-            final name = p.basenameWithoutExtension(fileName);
-            ComicFileType type = ComicFileType.unknown;
-            if (extension == '.cbz' || extension == '.zip') {
-              type = ComicFileType.cbz;
-            } else if (extension == '.cbr' || extension == '.rar') {
-              type = ComicFileType.cbr;
-            } else if (extension == '.pdf') {
-              type = ComicFileType.pdf;
-            }
-
-            Uint8List? thumbnail;
-            if (type == ComicFileType.cbz) {
-              try {
-                thumbnail = await compute(_extractFirstCBZPage, path);
-              } catch (e) {
-                debugPrint('Thumbnail extraction error during sync: $e');
-              }
-            }
-
-            updatedList.add(
-              Comic(
-                // Use a more unique ID to avoid collisions
-                id:
-                    '${DateTime.now().millisecondsSinceEpoch}_${fileName.hashCode}_${updatedList.length}',
-                title: name,
-                subtitle: type.toString().split('.').last.toUpperCase(),
-                imageUrl: '',
-                coverBytes: thumbnail,
-                progress: 0.0,
-                genre: 'Local File',
-                localPath: path,
-                source: ComicSource.local,
-                fileType: type,
-                description: 'Discovered in library folder: $dirPath',
-              ),
-            );
-            changed = true;
-          }
-        }
+        changed = true;
       }
-    } catch (e) {
-      debugPrint('ComicService: Error scanning directory $dirPath: $e');
     }
+
     return changed;
   }
 
+  /// =========================
+  /// UPDATE PROGRESS
+  /// =========================
   static Future<void> updateComicProgress(
     String id,
     double progress, {
@@ -347,20 +276,19 @@ class ComicService {
   }) async {
     final comics = await loadComics();
     final index = comics.indexWhere((c) => c.id == id);
+
     if (index != -1) {
       final old = comics[index];
+
       comics[index] = Comic(
         id: old.id,
         title: old.title,
         subtitle: old.subtitle,
         imageUrl: old.imageUrl,
         coverBytes: old.coverBytes,
+        thumbnailPath: old.thumbnailPath, // 🔥 penting (jangan hilang)
         progress: progress,
         genre: old.genre,
-        publisher: old.publisher,
-        releaseYear: old.releaseYear,
-        writer: old.writer,
-        artist: old.artist,
         description: old.description,
         pages: old.pages,
         localPath: old.localPath,
@@ -370,98 +298,86 @@ class ComicService {
         currentPage: currentPage ?? old.currentPage,
         totalPages: totalPages ?? old.totalPages,
       );
+
       await saveComics(comics);
     }
   }
 
-  /// Extracts all image pages from a CBZ file
+  /// =========================
+  /// CBZ THUMBNAIL
+  /// =========================
+  static Uint8List? _extractFirstCBZPage(String path) {
+    try {
+      final file = File(path);
+      if (!file.existsSync()) return null;
+
+      final archive = ZipDecoder().decodeBytes(file.readAsBytesSync());
+
+      final images =
+          archive.files.where((f) {
+            if (!f.isFile) return false;
+            final ext = p.extension(f.name).toLowerCase();
+            return ['.jpg', '.png', '.jpeg'].contains(ext);
+          }).toList();
+
+      images.sort((a, b) => a.name.compareTo(b.name));
+
+      if (images.isNotEmpty) {
+        final content = images.first.content;
+        if (content is Uint8List) return content;
+        if (content is List<int>) {
+          return Uint8List.fromList(content);
+        }
+      }
+    } catch (e) {
+      debugPrint('CBZ error: $e');
+    }
+
+    return null;
+  }
+
+  /// PUBLIC METHOD (dipanggil dari Reader)
   static Future<List<Uint8List>> getPagesFromCBZ(String path) async {
-    debugPrint('ComicService: Extracting pages from $path');
     return compute(_extractCBZPages, path);
   }
 
-  /// Background isolate function to avoid UI jank
+  /// BACKGROUND FUNCTION (WAJIB top-level / static)
   static List<Uint8List> _extractCBZPages(String path) {
     try {
       final file = File(path);
-      if (!file.existsSync()) {
-        debugPrint('ComicService: File not found: $path');
-        return [];
-      }
+      if (!file.existsSync()) return [];
 
       final bytes = file.readAsBytesSync();
-      debugPrint('ComicService: Read ${bytes.length} bytes');
       final archive = ZipDecoder().decodeBytes(bytes);
-      debugPrint(
-        'ComicService: Archive decoded, entries: ${archive.files.length}',
-      );
 
-      // Filter images and sort
       final imageFiles =
           archive.files.where((f) {
             if (!f.isFile) return false;
+
             final name = f.name.toLowerCase();
-            // Ignore system files
+
             if (name.contains('__macosx') ||
                 name.split('/').last.startsWith('.')) {
               return false;
             }
 
             final ext = p.extension(name);
-            return ['.jpg', '.jpeg', '.png', '.webp', '.gif'].contains(ext);
-          }).toList();
-
-      debugPrint('ComicService: Found ${imageFiles.length} image files');
-      imageFiles.sort((a, b) => a.name.compareTo(b.name));
-
-      final List<Uint8List> pages = [];
-      for (final f in imageFiles) {
-        final dynamic content = f.content;
-        if (content == null) continue;
-
-        if (content is Uint8List) {
-          pages.add(content);
-        } else if (content is List<int>) {
-          pages.add(Uint8List.fromList(content));
-        }
-      }
-
-      debugPrint('ComicService: Successfully extracted ${pages.length} pages');
-      return pages;
-    } catch (e) {
-      debugPrint('ComicService: Error extracting CBZ: $e');
-      return [];
-    }
-  }
-
-  static Uint8List? _extractFirstCBZPage(String path) {
-    try {
-      final file = File(path);
-      if (!file.existsSync()) return null;
-      final bytes = file.readAsBytesSync();
-      final archive = ZipDecoder().decodeBytes(bytes);
-
-      final imageFiles =
-          archive.files.where((file) {
-            if (!file.isFile) return false;
-            final ext = p.extension(file.name).toLowerCase();
             return ['.jpg', '.jpeg', '.png', '.webp'].contains(ext);
           }).toList();
 
       imageFiles.sort((a, b) => a.name.compareTo(b.name));
 
-      if (imageFiles.isNotEmpty) {
-        final content = imageFiles.first.content;
-        if (content is Uint8List) {
-          return content;
-        } else if (content is List<int>) {
-          return Uint8List.fromList(content);
-        }
-      }
-      return null;
+      return imageFiles.map((f) {
+        final content = f.content;
+
+        if (content is Uint8List) return content;
+        if (content is List<int>) return Uint8List.fromList(content);
+
+        return Uint8List(0);
+      }).toList();
     } catch (e) {
-      debugPrint('Error in _extractFirstCBZPage: $e');
-      return null;
+      debugPrint('CBZ extract error: $e');
+      return [];
     }
   }
 }

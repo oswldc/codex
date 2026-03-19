@@ -1,3 +1,5 @@
+import 'dart:io';
+
 import 'package:flutter/material.dart';
 import '../models/comic.dart';
 import '../services/comic_service.dart';
@@ -97,8 +99,11 @@ class _RecentPageState extends State<RecentPage> {
                   width: 60,
                   height: 90,
                   child:
-                      comic.coverBytes != null
-                          ? Image.memory(comic.coverBytes!, fit: BoxFit.cover)
+                      comic.thumbnailPath != null
+                          ? Image.file(
+                            File(comic.thumbnailPath!),
+                            fit: BoxFit.cover,
+                          )
                           : Container(
                             color: Colors.white10,
                             child: const Icon(
