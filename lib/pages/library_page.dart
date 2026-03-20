@@ -16,44 +16,100 @@ class LibraryPage extends StatefulWidget {
 class _LibraryPageState extends State<LibraryPage> {
   int _selectedIndex = 0;
   final List<Comic> _allComics = [];
+  List<Comic> _filteredComics = [];
+  bool _isLoading = false;
+  final TextEditingController _searchController = TextEditingController();
+  final FocusNode _searchFocusNode = FocusNode();
 
   @override
   void initState() {
     super.initState();
     _loadSavedComics();
+    _searchController.addListener(_onSearchChanged);
   }
 
-  Future<void> _loadSavedComics() async {
-    // Sync with physical folder first
-    final syncedComics = await ComicService.syncWithFolder();
+  @override
+  void dispose() {
+    _searchController.removeListener(_onSearchChanged);
+    _searchController.dispose();
+    _searchFocusNode.dispose();
+    super.dispose();
+  }
+
+  void _onSearchChanged() {
+    final query = _searchController.text.trim().toLowerCase();
+    setState(() {
+      _filteredComics =
+          query.isEmpty
+              ? List.from(_allComics)
+              : _allComics.where((c) {
+                return c.title.toLowerCase().contains(query) ||
+                    c.subtitle.toLowerCase().contains(query) ||
+                    c.genre.toLowerCase().contains(query);
+              }).toList();
+    });
+  }
+
+  // ─── Core fetch (tanpa guard, selalu jalan) ───────────────────────────────
+
+  Future<void> _fetchComics() async {
+    final comics = await ComicService.syncWithFolder();
     if (mounted) {
       setState(() {
-        _allComics.clear();
-        _allComics.addAll(syncedComics);
+        _allComics
+          ..clear()
+          ..addAll(comics);
+        _filteredComics = List.from(_allComics);
+        if (_searchController.text.trim().isNotEmpty) _onSearchChanged();
       });
     }
   }
+
+  // ─── Load dengan spinner (untuk refresh manual / initState) ───────────────
+
+  Future<void> _loadSavedComics() async {
+    if (_isLoading) return;
+    setState(() => _isLoading = true);
+    try {
+      await _fetchComics();
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('Gagal memuat library: $e'),
+            backgroundColor: Colors.redAccent,
+          ),
+        );
+      }
+    } finally {
+      if (mounted) setState(() => _isLoading = false);
+    }
+  }
+
+  // ─── Delete ───────────────────────────────────────────────────────────────
 
   Future<void> _deleteComic(Comic comic) async {
     final result = await showDialog<String>(
       context: context,
       builder:
           (context) => AlertDialog(
-            title: const Text('Delete Comic'),
-            content: Text('What do you want to do with "${comic.title}"?'),
+            title: const Text('Hapus Komik'),
+            content: Text(
+              'Apa yang ingin kamu lakukan dengan "${comic.title}"?',
+            ),
             actions: [
               TextButton(
                 onPressed: () => Navigator.pop(context, 'cancel'),
-                child: const Text('Cancel'),
+                child: const Text('Batal'),
               ),
               TextButton(
                 onPressed: () => Navigator.pop(context, 'library'),
-                child: const Text('Only remove from library'),
+                child: const Text('Hapus dari library'),
               ),
               TextButton(
                 onPressed: () => Navigator.pop(context, 'delete'),
                 child: const Text(
-                  'Delete file',
+                  'Hapus file',
                   style: TextStyle(color: Colors.redAccent),
                 ),
               ),
@@ -61,45 +117,55 @@ class _LibraryPageState extends State<LibraryPage> {
           ),
     );
 
-    if (result == 'library') {
-      await ComicService.deleteComic(comic, deleteFile: false);
-    } else if (result == 'delete') {
-      await ComicService.deleteComic(comic, deleteFile: true);
-    }
-
-    _loadSavedComics();
+    if (result == null || result == 'cancel') return;
+    await ComicService.deleteComic(comic, deleteFile: result == 'delete');
+    // ✅ Pakai _loadSavedComics biasa setelah delete
+    await _loadSavedComics();
   }
+
+  // ─── Add komik ────────────────────────────────────────────────────────────
 
   Future<void> _addLocalComics() async {
     try {
-      debugPrint('LibraryPage: _addLocalComics called');
+      // ✅ Buka file picker DULU — tidak set loading dulu
       final newComics = await ComicService.pickAndParseComics();
 
-      if (newComics.isNotEmpty) {
-        await _loadSavedComics(); // Refresh from folder
-        if (mounted) {
-          ScaffoldMessenger.of(context).showSnackBar(
-            SnackBar(
-              content: Text(
-                'Added ${newComics.length} comics to library',
-                style: const TextStyle(color: Colors.white),
-              ),
-              backgroundColor: Theme.of(context).primaryColor,
-            ),
-          );
-        }
-      } else {
-        debugPrint('LibraryPage: No comics were added (cancelled or empty)');
+      if (!mounted) return;
+
+      if (newComics.isEmpty) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('Tidak ada komik baru yang ditambahkan'),
+            backgroundColor: Colors.orange,
+          ),
+        );
+        return;
       }
-    } catch (e) {
-      debugPrint('LibraryPage Error: $e');
+
+      // ✅ Set loading lalu langsung fetch — TANPA memanggil _loadSavedComics
+      // agar tidak terkena guard "if (_isLoading) return"
+      setState(() => _isLoading = true);
+      try {
+        await _fetchComics();
+      } finally {
+        if (mounted) setState(() => _isLoading = false);
+      }
+
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(
-            content: Text(
-              'Error: $e',
-              style: const TextStyle(color: Colors.white),
-            ),
+            content: Text('${newComics.length} komik ditambahkan'),
+            backgroundColor: Theme.of(context).primaryColor,
+          ),
+        );
+      }
+    } catch (e) {
+      debugPrint('_addLocalComics error: $e');
+      if (mounted) {
+        setState(() => _isLoading = false);
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('Error: $e'),
             backgroundColor: Colors.redAccent,
           ),
         );
@@ -107,31 +173,10 @@ class _LibraryPageState extends State<LibraryPage> {
     }
   }
 
-  Future<void> _scanLibraryFolder() async {
-    try {
-      final selectedDir = await ComicService.pickLibraryDirectory();
-      if (selectedDir != null) {
-        await _loadSavedComics();
-        if (mounted) {
-          ScaffoldMessenger.of(context).showSnackBar(
-            SnackBar(
-              content: Text(
-                'Library folder set to $selectedDir',
-                style: const TextStyle(color: Colors.white),
-              ),
-              backgroundColor: Theme.of(context).primaryColor,
-            ),
-          );
-        }
-      }
-    } catch (e) {
-      debugPrint('LibraryPage Scan Error: $e');
-    }
-  }
+  // ─── Build ────────────────────────────────────────────────────────────────
 
   @override
   Widget build(BuildContext context) {
-    // Theme Colors
     final Color primaryColor = Theme.of(context).primaryColor;
     final Color accentColor = Theme.of(context).colorScheme.secondary;
 
@@ -139,171 +184,16 @@ class _LibraryPageState extends State<LibraryPage> {
       body: SafeArea(
         child: Column(
           children: [
-            // Top Header & Search Bar
-            Container(
-              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 20),
-              decoration: BoxDecoration(
-                color: Theme.of(context).scaffoldBackgroundColor,
-                border: Border(
-                  bottom: BorderSide(
-                    color: primaryColor.withValues(alpha: 0.1),
-                    width: 1,
-                  ),
-                ),
-              ),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                mainAxisSize: MainAxisSize.min,
+            _buildHeader(context, primaryColor),
+            Expanded(
+              child: IndexedStack(
+                index: _selectedIndex,
                 children: [
-                  Row(
-                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                    children: [
-                      Expanded(
-                        child: Text(
-                          _selectedIndex == 0
-                              ? 'Codex Library'
-                              : _selectedIndex == 1
-                              ? 'Recent Reads'
-                              : 'Settings',
-                          style: const TextStyle(
-                            fontSize: 28,
-                            fontWeight: FontWeight.bold,
-                            letterSpacing: -0.5,
-                          ),
-                          overflow: TextOverflow.ellipsis,
-                        ),
-                      ),
-                      Row(
-                        mainAxisSize: MainAxisSize.min,
-                        children: [
-                          IconButton(
-                            onPressed: _loadSavedComics,
-                            icon: const Icon(
-                              Icons.refresh,
-                              color: Colors.white70,
-                            ),
-                          ),
-                          PopupMenuButton<String>(
-                            icon: const Icon(
-                              Icons.more_vert,
-                              color: Colors.white70,
-                            ),
-                            onSelected: (value) {
-                              if (value == 'scan') {
-                                _scanLibraryFolder();
-                              }
-                            },
-                            itemBuilder:
-                                (context) => [
-                                  const PopupMenuItem(
-                                    value: 'scan',
-                                    child: Text('Set Library Folder'),
-                                  ),
-                                ],
-                          ),
-                        ],
-                      ),
-                    ],
-                  ),
-                  const SizedBox(height: 16),
-                  TextField(
-                    decoration: InputDecoration(
-                      hintText: 'Search your comics...',
-                      prefixIcon: const Icon(
-                        Icons.search,
-                        color: Colors.white38,
-                      ),
-                      filled: true,
-                      fillColor: primaryColor.withValues(alpha: 0.1),
-                      border: OutlineInputBorder(
-                        borderRadius: BorderRadius.circular(16),
-                        borderSide: BorderSide.none,
-                      ),
-                      contentPadding: const EdgeInsets.symmetric(vertical: 12),
-                    ),
-                  ),
+                  _buildLibraryTab(context, accentColor),
+                  const RecentPage(),
+                  const Center(child: Text('Settings Coming Soon')),
                 ],
               ),
-            ),
-
-            // Content Based on Selected Index
-            Expanded(
-              child:
-                  _selectedIndex == 0
-                      ? (_allComics.isEmpty
-                          ? Center(
-                            child: Column(
-                              mainAxisAlignment: MainAxisAlignment.center,
-                              children: [
-                                Icon(
-                                  Icons.menu_book,
-                                  size: 128,
-                                  color: Colors.white10,
-                                ),
-                                const SizedBox(height: 12),
-                                ElevatedButton(
-                                  onPressed: _addLocalComics,
-                                  style: ElevatedButton.styleFrom(
-                                    backgroundColor: accentColor,
-                                    foregroundColor:
-                                        Theme.of(
-                                          context,
-                                        ).colorScheme.onSecondary,
-                                    padding: const EdgeInsets.symmetric(
-                                      horizontal: 24,
-                                      vertical: 12,
-                                    ),
-                                    shape: const StadiumBorder(),
-                                  ),
-                                  child: const Text('Add Local Comics'),
-                                ),
-                                const SizedBox(height: 12),
-                                OutlinedButton(
-                                  onPressed: _scanLibraryFolder,
-                                  style: OutlinedButton.styleFrom(
-                                    foregroundColor: Colors.white70,
-                                    side: const BorderSide(
-                                      color: Colors.white10,
-                                    ),
-                                    shape: const StadiumBorder(),
-                                  ),
-                                  child: const Text('Add Library Folder'),
-                                ),
-                              ],
-                            ),
-                          )
-                          : GridView.builder(
-                            padding: const EdgeInsets.all(16),
-                            gridDelegate:
-                                const SliverGridDelegateWithFixedCrossAxisCount(
-                                  crossAxisCount: 2,
-                                  childAspectRatio: 0.6,
-                                  crossAxisSpacing: 16,
-                                  mainAxisSpacing: 24,
-                                ),
-                            itemCount: _allComics.length,
-                            itemBuilder: (context, index) {
-                              final comic = _allComics[index];
-                              return ComicCard(
-                                comic: comic,
-                                onTap: () async {
-                                  await Navigator.push(
-                                    context,
-                                    MaterialPageRoute(
-                                      builder:
-                                          (context) =>
-                                              ComicDetailPage(comic: comic),
-                                    ),
-                                  );
-                                  _loadSavedComics();
-                                },
-                                onDelete: () => _deleteComic(comic),
-                              );
-                            },
-                          ))
-                      : _selectedIndex == 1
-                      ? const RecentPage()
-                      : const Center(child: Text('Settings Coming Soon')),
             ),
           ],
         ),
@@ -333,11 +223,7 @@ class _LibraryPageState extends State<LibraryPage> {
           backgroundColor: Theme.of(context).scaffoldBackgroundColor,
           selectedItemColor: accentColor,
           unselectedItemColor: Colors.white38,
-          onTap: (index) {
-            setState(() {
-              _selectedIndex = index;
-            });
-          },
+          onTap: (index) => setState(() => _selectedIndex = index),
           items: const [
             BottomNavigationBarItem(
               icon: Icon(Icons.auto_stories),
@@ -353,7 +239,184 @@ class _LibraryPageState extends State<LibraryPage> {
       ),
     );
   }
+
+  // ─── Header ───────────────────────────────────────────────────────────────
+
+  Widget _buildHeader(BuildContext context, Color primaryColor) {
+    final titles = ['Codex Library', 'Recent Reads', 'Settings'];
+
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 20),
+      decoration: BoxDecoration(
+        color: Theme.of(context).scaffoldBackgroundColor,
+        border: Border(
+          bottom: BorderSide(
+            color: primaryColor.withValues(alpha: 0.1),
+            width: 1,
+          ),
+        ),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Row(
+            children: [
+              Expanded(
+                child: Text(
+                  titles[_selectedIndex],
+                  style: const TextStyle(
+                    fontSize: 28,
+                    fontWeight: FontWeight.bold,
+                    letterSpacing: -0.5,
+                  ),
+                  overflow: TextOverflow.ellipsis,
+                ),
+              ),
+              if (_isLoading)
+                const Padding(
+                  padding: EdgeInsets.all(12),
+                  child: SizedBox(
+                    width: 20,
+                    height: 20,
+                    child: CircularProgressIndicator(strokeWidth: 2),
+                  ),
+                )
+              else
+                IconButton(
+                  onPressed: _loadSavedComics,
+                  icon: const Icon(Icons.refresh, color: Colors.white70),
+                  tooltip: 'Refresh',
+                ),
+            ],
+          ),
+          if (_selectedIndex == 0) ...[
+            const SizedBox(height: 16),
+            TextField(
+              controller: _searchController,
+              focusNode: _searchFocusNode,
+              decoration: InputDecoration(
+                hintText: 'Cari komik...',
+                prefixIcon: const Icon(Icons.search, color: Colors.white38),
+                suffixIcon:
+                    _searchController.text.isNotEmpty
+                        ? IconButton(
+                          icon: const Icon(Icons.clear, color: Colors.white38),
+                          onPressed: () {
+                            _searchController.clear();
+                            _onSearchChanged();
+                          },
+                        )
+                        : null,
+                filled: true,
+                fillColor: primaryColor.withValues(alpha: 0.1),
+                border: OutlineInputBorder(
+                  borderRadius: BorderRadius.circular(16),
+                  borderSide: BorderSide.none,
+                ),
+                contentPadding: const EdgeInsets.symmetric(vertical: 12),
+              ),
+            ),
+          ],
+        ],
+      ),
+    );
+  }
+
+  // ─── Library Tab ──────────────────────────────────────────────────────────
+
+  Widget _buildLibraryTab(BuildContext context, Color accentColor) {
+    if (!_isLoading && _allComics.isEmpty) {
+      return Center(
+        child: Column(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            const Icon(Icons.menu_book, size: 128, color: Colors.white10),
+            const SizedBox(height: 12),
+            const Text(
+              'Library kosong',
+              style: TextStyle(color: Colors.white38, fontSize: 16),
+            ),
+            const SizedBox(height: 4),
+            const Text(
+              'Tekan + untuk menambah komik',
+              style: TextStyle(color: Colors.white24, fontSize: 13),
+            ),
+            const SizedBox(height: 24),
+            ElevatedButton.icon(
+              onPressed: _addLocalComics,
+              icon: const Icon(Icons.add),
+              label: const Text('Tambah Komik'),
+              style: ElevatedButton.styleFrom(
+                backgroundColor: accentColor,
+                foregroundColor: Theme.of(context).colorScheme.onSecondary,
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 24,
+                  vertical: 12,
+                ),
+                shape: const StadiumBorder(),
+              ),
+            ),
+          ],
+        ),
+      );
+    }
+
+    if (!_isLoading && _filteredComics.isEmpty && _allComics.isNotEmpty) {
+      return Center(
+        child: Column(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            const Icon(Icons.search_off, size: 64, color: Colors.white24),
+            const SizedBox(height: 12),
+            Text(
+              'Tidak ada hasil untuk "${_searchController.text}"',
+              style: const TextStyle(color: Colors.white38),
+            ),
+          ],
+        ),
+      );
+    }
+
+    return GestureDetector(
+      onTap: () => _searchFocusNode.unfocus(),
+      behavior: HitTestBehavior.translucent,
+      child: RefreshIndicator(
+        onRefresh: _loadSavedComics,
+        child: GridView.builder(
+          padding: const EdgeInsets.all(16),
+          gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
+            crossAxisCount: 2,
+            childAspectRatio: 0.6,
+            crossAxisSpacing: 16,
+            mainAxisSpacing: 24,
+          ),
+          itemCount: _filteredComics.length,
+          itemBuilder: (context, index) {
+            final comic = _filteredComics[index];
+            return ComicCard(
+              comic: comic,
+              onTap: () async {
+                _searchFocusNode.unfocus();
+                FocusScope.of(context).unfocus();
+                await Navigator.push(
+                  context,
+                  MaterialPageRoute(
+                    builder: (context) => ComicDetailPage(comic: comic),
+                  ),
+                );
+                await _loadSavedComics();
+              },
+              onDelete: () => _deleteComic(comic),
+            );
+          },
+        ),
+      ),
+    );
+  }
 }
+
+// ─── Comic Card ───────────────────────────────────────────────────────────────
 
 class ComicCard extends StatelessWidget {
   final Comic comic;
@@ -393,34 +456,7 @@ class ComicCard extends StatelessWidget {
                 child: Stack(
                   fit: StackFit.expand,
                   children: [
-                    comic.source == ComicSource.local &&
-                            comic.thumbnailPath != null
-                        ? Image.file(
-                          File(comic.thumbnailPath!),
-                          fit: BoxFit.cover,
-                        )
-                        : comic.imageUrl.isNotEmpty
-                        ? CachedNetworkImage(
-                          imageUrl: comic.imageUrl,
-                          fit: BoxFit.cover,
-                          placeholder:
-                              (context, url) =>
-                                  Container(color: Colors.white10),
-                          errorWidget:
-                              (context, url, error) => Container(
-                                color: Colors.white10,
-                                child: Icon(Icons.book, color: Colors.white24),
-                              ),
-                        )
-                        : Container(
-                          color: Colors.white10,
-                          child: Icon(
-                            Icons.book,
-                            size: 48,
-                            color: Colors.white24,
-                          ),
-                        ),
-                    // Progress Bar
+                    _buildCover(),
                     Positioned(
                       bottom: 0,
                       left: 0,
@@ -430,12 +466,11 @@ class ComicCard extends StatelessWidget {
                         color: Colors.black45,
                         child: FractionallySizedBox(
                           alignment: Alignment.centerLeft,
-                          widthFactor: comic.progress,
+                          widthFactor: comic.progress.clamp(0.0, 1.0),
                           child: Container(color: primaryColor),
                         ),
                       ),
                     ),
-                    // Done Tag
                     Positioned(
                       top: 8,
                       right: 8,
@@ -463,25 +498,26 @@ class ComicCard extends StatelessWidget {
                         ),
                       ),
                     ),
-                    // Delete Button
                     Positioned(
                       bottom: 12,
                       right: 8,
-                      child: GestureDetector(
-                        onTap: () {
-                          onDelete();
-                        },
-                        child: Container(
-                          padding: const EdgeInsets.all(6),
-                          decoration: BoxDecoration(
-                            color: Colors.black54,
-                            shape: BoxShape.circle,
-                            border: Border.all(color: Colors.white10),
-                          ),
-                          child: const Icon(
-                            Icons.delete_outline,
-                            size: 18,
-                            color: Colors.redAccent,
+                      child: Material(
+                        color: Colors.transparent,
+                        child: InkWell(
+                          onTap: onDelete,
+                          borderRadius: BorderRadius.circular(20),
+                          child: Container(
+                            padding: const EdgeInsets.all(6),
+                            decoration: BoxDecoration(
+                              color: Colors.black54,
+                              shape: BoxShape.circle,
+                              border: Border.all(color: Colors.white10),
+                            ),
+                            child: const Icon(
+                              Icons.delete_outline,
+                              size: 18,
+                              color: Colors.redAccent,
+                            ),
                           ),
                         ),
                       ),
@@ -519,10 +555,42 @@ class ComicCard extends StatelessWidget {
           ),
           const SizedBox(height: 2),
           Text(
-            '${comic.subtitle}${comic.genre.isNotEmpty ? " • ${comic.genre}" : ""}',
+            [
+              comic.subtitle,
+              if (comic.genre.isNotEmpty) comic.genre,
+            ].join(' • '),
             style: const TextStyle(fontSize: 12, color: Colors.white38),
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
           ),
         ],
+      ),
+    );
+  }
+
+  Widget _buildCover() {
+    if (comic.source == ComicSource.local && comic.thumbnailPath != null) {
+      final file = File(comic.thumbnailPath!);
+      if (file.existsSync()) {
+        return Image.file(file, fit: BoxFit.cover);
+      }
+    }
+    if (comic.imageUrl.isNotEmpty) {
+      return CachedNetworkImage(
+        imageUrl: comic.imageUrl,
+        fit: BoxFit.cover,
+        placeholder: (context, url) => Container(color: Colors.white10),
+        errorWidget: (context, url, error) => _placeholder(),
+      );
+    }
+    return _placeholder();
+  }
+
+  Widget _placeholder() {
+    return Container(
+      color: Colors.white10,
+      child: const Center(
+        child: Icon(Icons.book, size: 48, color: Colors.white24),
       ),
     );
   }

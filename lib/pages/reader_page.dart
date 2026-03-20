@@ -5,6 +5,7 @@ import 'package:cached_network_image/cached_network_image.dart';
 import 'package:pdfrx/pdfrx.dart';
 import '../models/comic.dart';
 import '../services/comic_service.dart';
+import '../services/reading_history_service.dart';
 
 class ReaderPage extends StatefulWidget {
   final Comic comic;
@@ -35,7 +36,6 @@ class _ReaderPageState extends State<ReaderPage> {
     _isLoading = true;
     _pageController = PageController();
 
-    // Load progress
     double initialProgress = widget.comic.progress;
 
     WidgetsBinding.instance.addPostFrameCallback((_) async {
@@ -45,7 +45,8 @@ class _ReaderPageState extends State<ReaderPage> {
         int total = -1;
         List<Uint8List> localPages = [];
 
-        if (widget.comic.fileType == ComicFileType.cbz &&
+        if ((widget.comic.fileType == ComicFileType.cbz ||
+                widget.comic.fileType == ComicFileType.cbr) &&
             widget.comic.localPath != null) {
           setState(() => _loadingMessage = 'Extracting pages...');
           localPages = await ComicService.getPagesFromCBZ(
@@ -58,9 +59,6 @@ class _ReaderPageState extends State<ReaderPage> {
 
         if (total > 0) {
           int targetPage = (initialProgress * total).round().clamp(1, total);
-
-          // Crucial: Re-initialize PageController with the correct initialPage
-          // before the PageView is actually built (isLoading = false)
           _pageController.dispose();
           _pageController = PageController(initialPage: targetPage - 1);
 
@@ -73,7 +71,6 @@ class _ReaderPageState extends State<ReaderPage> {
           });
         } else if (widget.comic.fileType == ComicFileType.pdf) {
           setState(() => _isLoading = false);
-          // PDF will handle its own initialization in the listener
         } else {
           setState(() {
             _totalPages = 0;
@@ -97,7 +94,6 @@ class _ReaderPageState extends State<ReaderPage> {
           (_totalPages == -1 || _totalPages != _pdfController.pageCount)) {
         setState(() => _totalPages = _pdfController.pageCount);
 
-        // Initial jump for PDF
         if (_isFirstLoad && initialProgress > 0) {
           _isFirstLoad = false;
           final total = _pdfController.pageCount;
@@ -123,13 +119,27 @@ class _ReaderPageState extends State<ReaderPage> {
 
   @override
   void dispose() {
-    double progress = _totalPages > 0 ? (_currentPage / _totalPages) : 0.0;
+    final progress = _totalPages > 0 ? (_currentPage / _totalPages) : 0.0;
+
     ComicService.updateComicProgress(
       widget.comic.id,
       progress,
       currentPage: _currentPage,
       totalPages: _totalPages,
     );
+
+    ReadingHistoryService.saveEntry(
+      ReadingHistoryEntry(
+        id: widget.comic.id,
+        title: widget.comic.title,
+        subtitle: widget.comic.subtitle,
+        thumbnailPath: widget.comic.thumbnailPath,
+        currentPage: _currentPage,
+        totalPages: _totalPages > 0 ? _totalPages : 0,
+        lastRead: DateTime.now().millisecondsSinceEpoch,
+      ),
+    );
+
     _pageController.dispose();
     super.dispose();
   }
@@ -140,13 +150,10 @@ class _ReaderPageState extends State<ReaderPage> {
       backgroundColor: Colors.black,
       body: Stack(
         children: [
-          // Comic Content
           GestureDetector(
             onTap: () => setState(() => _showUI = !_showUI),
             child: _buildReaderContent(),
           ),
-
-          // Top Bar
           AnimatedPositioned(
             duration: const Duration(milliseconds: 300),
             top: _showUI ? 0 : -120,
@@ -154,8 +161,6 @@ class _ReaderPageState extends State<ReaderPage> {
             right: 0,
             child: _buildTopBar(context),
           ),
-
-          // Bottom Bar
           AnimatedPositioned(
             duration: const Duration(milliseconds: 300),
             bottom: _showUI ? 0 : -180,
@@ -177,12 +182,9 @@ class _ReaderPageState extends State<ReaderPage> {
       height: double.infinity,
       child: Stack(
         children: [
-          // Reader Content
           if (!_isLoading &&
               (_totalPages > 0 || widget.comic.fileType == ComicFileType.pdf))
             _buildMainContent(primaryColor),
-
-          // No Pages Found (After loading finished)
           if (!_isLoading && _totalPages == 0)
             Center(
               child: Column(
@@ -206,8 +208,6 @@ class _ReaderPageState extends State<ReaderPage> {
                 ],
               ),
             ),
-
-          // Loading Overlay
           if (_isLoading)
             Center(
               child: Column(
@@ -444,14 +444,6 @@ class _ReaderPageState extends State<ReaderPage> {
                     style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold),
                   ),
                   const SizedBox(height: 24),
-                  _buildSettingLabel(Icons.light_mode, 'Brightness', '85%'),
-                  Slider(
-                    value: 0.85,
-                    onChanged: (v) {},
-                    activeColor: primaryColor,
-                    inactiveColor: Colors.white10,
-                  ),
-                  const SizedBox(height: 16),
                   const Text(
                     'Reading Mode',
                     style: TextStyle(
@@ -491,49 +483,10 @@ class _ReaderPageState extends State<ReaderPage> {
                     ],
                   ),
                   const SizedBox(height: 24),
-                  Center(
-                    child: TextButton(
-                      onPressed: () {},
-                      child: Text(
-                        'RESET TO DEFAULT',
-                        style: TextStyle(
-                          color: primaryColor,
-                          fontWeight: FontWeight.bold,
-                          letterSpacing: 1.1,
-                        ),
-                      ),
-                    ),
-                  ),
-                  const SizedBox(height: 12),
                 ],
               ),
             ),
           ),
-    );
-  }
-
-  Widget _buildSettingLabel(IconData icon, String label, String value) {
-    return Row(
-      mainAxisAlignment: MainAxisAlignment.spaceBetween,
-      children: [
-        Row(
-          children: [
-            Icon(icon, size: 18, color: Theme.of(context).primaryColor),
-            const SizedBox(width: 8),
-            Text(
-              label,
-              style: const TextStyle(
-                color: Colors.white70,
-                fontWeight: FontWeight.w500,
-              ),
-            ),
-          ],
-        ),
-        Text(
-          value,
-          style: const TextStyle(color: Colors.white38, fontSize: 12),
-        ),
-      ],
     );
   }
 

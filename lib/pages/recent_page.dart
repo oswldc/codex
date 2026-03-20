@@ -1,8 +1,8 @@
 import 'dart:io';
-
 import 'package:flutter/material.dart';
 import '../models/comic.dart';
 import '../services/comic_service.dart';
+import '../services/reading_history_service.dart';
 import 'reader_page.dart';
 
 class RecentPage extends StatefulWidget {
@@ -12,145 +12,328 @@ class RecentPage extends StatefulWidget {
   State<RecentPage> createState() => _RecentPageState();
 }
 
-class _RecentPageState extends State<RecentPage> {
-  List<Comic> _recentComics = [];
+class _RecentPageState extends State<RecentPage> with WidgetsBindingObserver {
+  List<ReadingHistoryEntry> _history = [];
+  Set<String> _libraryIds = {};
   bool _isLoading = true;
+
+  // ─── Lifecycle ────────────────────────────────────────────────────────────
 
   @override
   void initState() {
     super.initState();
-    _loadRecentComics();
+    WidgetsBinding.instance.addObserver(this);
+    _loadAll();
   }
 
-  Future<void> _loadRecentComics() async {
-    setState(() => _isLoading = true);
+  @override
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    super.dispose();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed) _loadAll();
+  }
+
+  // ─── Data ─────────────────────────────────────────────────────────────────
+
+  Future<void> _loadAll() async {
+    if (_history.isEmpty) setState(() => _isLoading = true);
+
+    // Ambil semua komik dari library
     final allComics = await ComicService.loadComics();
 
-    // Filter comics that have been read (lastRead is not null)
-    // and sort by lastRead descending (most recent first)
-    final recent =
-        allComics.where((c) => c.lastRead != null).toList()
-          ..sort((a, b) => b.lastRead!.compareTo(a.lastRead!));
+    // ✅ Migrasi data lama (hanya jalan sekali)
+    await ReadingHistoryService.migrateFromComics(allComics);
+
+    // Load riwayat dari service terpisah
+    final history = await ReadingHistoryService.loadHistory();
 
     if (mounted) {
       setState(() {
-        _recentComics = recent;
+        _history = history;
+        _libraryIds = allComics.map((c) => c.id).toSet();
         _isLoading = false;
       });
     }
   }
 
+  // ─── Helpers ──────────────────────────────────────────────────────────────
+
+  String _formatRelativeTime(int? timestamp) {
+    if (timestamp == null) return '';
+    final dateTime = DateTime.fromMillisecondsSinceEpoch(timestamp);
+    final diff = DateTime.now().difference(dateTime);
+
+    if (diff.inSeconds < 60) return 'Baru saja';
+    if (diff.inMinutes < 60) return '${diff.inMinutes} menit lalu';
+    if (diff.inHours < 24) return '${diff.inHours} jam lalu';
+    if (diff.inDays == 1) return 'Kemarin';
+    if (diff.inDays < 7) return '${diff.inDays} hari lalu';
+
+    return '${dateTime.day}/${dateTime.month}/${dateTime.year}';
+  }
+
+  // ─── Build ────────────────────────────────────────────────────────────────
+
   @override
   Widget build(BuildContext context) {
     final Color primaryColor = Theme.of(context).primaryColor;
+    final Color accentColor = Theme.of(context).colorScheme.secondary;
 
     if (_isLoading) {
       return const Center(child: CircularProgressIndicator());
     }
 
-    if (_recentComics.isEmpty) {
-      return Center(
-        child: Column(
-          mainAxisAlignment: MainAxisAlignment.center,
+    if (_history.isEmpty) {
+      return RefreshIndicator(
+        onRefresh: _loadAll,
+        color: accentColor,
+        child: ListView(
+          physics: const AlwaysScrollableScrollPhysics(),
           children: [
-            Icon(Icons.history, size: 64, color: Colors.white10),
-            const SizedBox(height: 16),
-            Text('No recent activity', style: TextStyle(color: Colors.white38)),
+            SizedBox(
+              height: MediaQuery.of(context).size.height * 0.65,
+              child: const Column(
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: [
+                  Icon(Icons.history, size: 72, color: Colors.white10),
+                  SizedBox(height: 16),
+                  Text(
+                    'Belum ada riwayat baca',
+                    style: TextStyle(color: Colors.white38, fontSize: 16),
+                  ),
+                  SizedBox(height: 8),
+                  Text(
+                    'Tarik ke bawah untuk memperbarui',
+                    style: TextStyle(color: Colors.white24, fontSize: 12),
+                  ),
+                ],
+              ),
+            ),
           ],
         ),
       );
     }
 
-    return ListView.builder(
-      padding: const EdgeInsets.all(16),
-      itemCount: _recentComics.length,
-      itemBuilder: (context, index) {
-        final comic = _recentComics[index];
-        return _buildRecentItem(comic, primaryColor);
-      },
+    return RefreshIndicator(
+      onRefresh: _loadAll,
+      color: accentColor,
+      child: ListView.builder(
+        padding: const EdgeInsets.fromLTRB(16, 16, 16, 32),
+        physics: const AlwaysScrollableScrollPhysics(),
+        itemCount: _history.length,
+        itemBuilder: (context, index) {
+          return _buildHistoryItem(_history[index], primaryColor, accentColor);
+        },
+      ),
     );
   }
 
-  Widget _buildRecentItem(Comic comic, Color primaryColor) {
+  // ─── Item Card ────────────────────────────────────────────────────────────
+
+  Widget _buildHistoryItem(
+    ReadingHistoryEntry entry,
+    Color primaryColor,
+    Color accentColor,
+  ) {
+    final bool isDeleted = !_libraryIds.contains(entry.id);
+    final bool fileExists =
+        entry.thumbnailPath != null && File(entry.thumbnailPath!).existsSync();
+
     return Container(
       margin: const EdgeInsets.only(bottom: 16),
       decoration: BoxDecoration(
-        color: primaryColor.withValues(alpha: 0.05),
+        color:
+            isDeleted
+                ? Colors.white.withValues(alpha: 0.02)
+                : primaryColor.withValues(alpha: 0.05),
         borderRadius: BorderRadius.circular(16),
-        border: Border.all(color: Colors.white.withValues(alpha: 0.05)),
+        border: Border.all(
+          color:
+              isDeleted
+                  ? Colors.white.withValues(alpha: 0.03)
+                  : Colors.white.withValues(alpha: 0.05),
+        ),
       ),
       child: InkWell(
         onTap: () async {
+          if (isDeleted) {
+            ScaffoldMessenger.of(context).showSnackBar(
+              SnackBar(
+                content: const Text('File komik tidak ditemukan di library'),
+                backgroundColor: Colors.red.shade700,
+                behavior: SnackBarBehavior.floating,
+                action: SnackBarAction(
+                  label: 'Hapus Riwayat',
+                  textColor: Colors.white,
+                  onPressed: () async {
+                    await ReadingHistoryService.removeEntry(entry.id);
+                    _loadAll();
+                  },
+                ),
+              ),
+            );
+            return;
+          }
+
+          final allComics = await ComicService.loadComics();
+          final Comic? comic =
+              allComics.where((c) => c.id == entry.id).firstOrNull;
+          if (!mounted || comic == null) return;
+
           await Navigator.push(
             context,
             MaterialPageRoute(builder: (context) => ReaderPage(comic: comic)),
           );
-          _loadRecentComics(); // Refresh progress when returning
+          _loadAll();
         },
         borderRadius: BorderRadius.circular(16),
         child: Padding(
           padding: const EdgeInsets.all(12),
           child: Row(
             children: [
-              // Comic Cover
-              ClipRRect(
-                borderRadius: BorderRadius.circular(8),
-                child: SizedBox(
-                  width: 60,
-                  height: 90,
-                  child:
-                      comic.thumbnailPath != null
-                          ? Image.file(
-                            File(comic.thumbnailPath!),
-                            fit: BoxFit.cover,
-                          )
-                          : Container(
-                            color: Colors.white10,
-                            child: const Icon(
-                              Icons.book,
-                              color: Colors.white24,
-                            ),
+              // ── Cover ───────────────────────────────────────────────────
+              Stack(
+                children: [
+                  ClipRRect(
+                    borderRadius: BorderRadius.circular(8),
+                    child: SizedBox(
+                      width: 60,
+                      height: 90,
+                      child:
+                          fileExists
+                              ? ColorFiltered(
+                                colorFilter:
+                                    isDeleted
+                                        ? const ColorFilter.matrix([
+                                          0.2126,
+                                          0.7152,
+                                          0.0722,
+                                          0,
+                                          0,
+                                          0.2126,
+                                          0.7152,
+                                          0.0722,
+                                          0,
+                                          0,
+                                          0.2126,
+                                          0.7152,
+                                          0.0722,
+                                          0,
+                                          0,
+                                          0,
+                                          0,
+                                          0,
+                                          1,
+                                          0,
+                                        ])
+                                        : const ColorFilter.mode(
+                                          Colors.transparent,
+                                          BlendMode.multiply,
+                                        ),
+                                child: Image.file(
+                                  File(entry.thumbnailPath!),
+                                  fit: BoxFit.cover,
+                                ),
+                              )
+                              : Container(
+                                color: Colors.white10,
+                                child: const Icon(
+                                  Icons.book,
+                                  color: Colors.white24,
+                                ),
+                              ),
+                    ),
+                  ),
+                  if (isDeleted)
+                    Positioned(
+                      bottom: 0,
+                      left: 0,
+                      right: 0,
+                      child: Container(
+                        padding: const EdgeInsets.symmetric(vertical: 3),
+                        decoration: BoxDecoration(
+                          color: Colors.red.shade900.withValues(alpha: 0.85),
+                          borderRadius: const BorderRadius.only(
+                            bottomLeft: Radius.circular(8),
+                            bottomRight: Radius.circular(8),
                           ),
-                ),
+                        ),
+                        child: const Text(
+                          'Dihapus',
+                          textAlign: TextAlign.center,
+                          style: TextStyle(fontSize: 9, color: Colors.white70),
+                        ),
+                      ),
+                    ),
+                ],
               ),
+
               const SizedBox(width: 16),
-              // Comic Info
+
+              // ── Info ────────────────────────────────────────────────────
               Expanded(
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
                     Text(
-                      comic.title,
-                      style: const TextStyle(
-                        fontSize: 16,
+                      entry.title,
+                      style: TextStyle(
+                        fontSize: 15,
                         fontWeight: FontWeight.bold,
+                        color: isDeleted ? Colors.white38 : null,
                       ),
                       maxLines: 1,
                       overflow: TextOverflow.ellipsis,
                     ),
-                    const SizedBox(height: 4),
+                    const SizedBox(height: 2),
                     Text(
-                      comic.subtitle,
+                      entry.subtitle,
                       style: const TextStyle(
                         fontSize: 12,
                         color: Colors.white38,
                       ),
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
                     ),
-                    const SizedBox(height: 12),
-                    // Progress Info
+                    const SizedBox(height: 6),
+                    Row(
+                      children: [
+                        Icon(
+                          Icons.access_time_rounded,
+                          size: 11,
+                          color: accentColor.withValues(alpha: 0.6),
+                        ),
+                        const SizedBox(width: 4),
+                        Text(
+                          _formatRelativeTime(entry.lastRead),
+                          style: TextStyle(
+                            fontSize: 11,
+                            color: accentColor.withValues(alpha: 0.6),
+                          ),
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 10),
                     Row(
                       mainAxisAlignment: MainAxisAlignment.spaceBetween,
                       children: [
                         Text(
-                          'Page ${comic.currentPage ?? 0} of ${comic.totalPages ?? "0"}',
+                          'Hal. ${entry.currentPage} / ${entry.totalPages}',
                           style: TextStyle(
                             fontSize: 12,
-                            color: primaryColor.withValues(alpha: 0.8),
+                            color:
+                                isDeleted
+                                    ? Colors.white24
+                                    : accentColor.withValues(alpha: 0.85),
                             fontWeight: FontWeight.w600,
                           ),
                         ),
                         Text(
-                          '${(comic.progress * 100).toInt()}%',
+                          '${(entry.progress * 100).toInt()}%',
                           style: const TextStyle(
                             fontSize: 12,
                             color: Colors.white38,
@@ -159,21 +342,32 @@ class _RecentPageState extends State<RecentPage> {
                       ],
                     ),
                     const SizedBox(height: 6),
-                    // Progress Bar
-                    ClipRRect(
-                      borderRadius: BorderRadius.circular(4),
+                    Container(
+                      height: 4,
+                      clipBehavior: Clip.hardEdge,
+                      decoration: BoxDecoration(
+                        borderRadius: BorderRadius.circular(4),
+                        color: Colors.white10,
+                      ),
                       child: LinearProgressIndicator(
-                        value: comic.progress,
-                        backgroundColor: Colors.white10,
-                        valueColor: AlwaysStoppedAnimation<Color>(primaryColor),
+                        value: entry.progress,
+                        backgroundColor: Colors.transparent,
+                        valueColor: AlwaysStoppedAnimation<Color>(
+                          isDeleted ? Colors.white24 : accentColor,
+                        ),
                         minHeight: 4,
                       ),
                     ),
                   ],
                 ),
               ),
+
               const SizedBox(width: 8),
-              Icon(Icons.chevron_right, color: Colors.white24),
+              Icon(
+                isDeleted ? Icons.block : Icons.chevron_right,
+                color: Colors.white24,
+                size: 20,
+              ),
             ],
           ),
         ),
