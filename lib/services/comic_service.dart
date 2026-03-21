@@ -7,6 +7,7 @@ import 'package:archive/archive.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:path_provider/path_provider.dart';
 import '../models/comic.dart';
+import 'package:pdfx/pdfx.dart';
 
 class ComicService {
   static const String _comicsKey = 'saved_comics';
@@ -58,7 +59,17 @@ class ComicService {
             await File(thumbnailPath).writeAsBytes(thumb);
           }
         } catch (e) {
-          debugPrint('Thumbnail error: $e');
+          debugPrint('CBZ thumbnail error: $e');
+        }
+      } else if (type == ComicFileType.pdf) {
+        try {
+          final thumb = await _extractFirstPDFPage(filePath);
+          if (thumb != null) {
+            thumbnailPath = await getThumbnailPath(fileName);
+            await File(thumbnailPath).writeAsBytes(thumb);
+          }
+        } catch (e) {
+          debugPrint('PDF thumbnail error: $e');
         }
       }
 
@@ -268,6 +279,30 @@ class ComicService {
     } catch (e) {
       debugPrint('CBZ extract error: $e');
       return [];
+    }
+  }
+
+  static Future<Uint8List?> _extractFirstPDFPage(String path) async {
+    PdfDocument? document;
+    try {
+      document = await PdfDocument.openFile(path);
+      if (document.pagesCount == 0) return null;
+
+      final page = await document.getPage(1);
+      final pageImage = await page.render(
+        width: page.width * 2,
+        height: page.height * 2,
+        format: PdfPageImageFormat.jpeg,
+        backgroundColor: '#ffffff',
+      );
+      await page.close();
+
+      return pageImage?.bytes;
+    } catch (e) {
+      debugPrint('PDF thumbnail error: $e');
+      return null;
+    } finally {
+      await document?.close();
     }
   }
 }

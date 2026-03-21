@@ -163,12 +163,15 @@ class _RecentPageState extends State<RecentPage> with WidgetsBindingObserver {
           if (isDeleted) {
             ScaffoldMessenger.of(context).showSnackBar(
               SnackBar(
-                content: const Text('File komik tidak ditemukan di library'),
-                backgroundColor: Colors.red.shade700,
+                content: const Text(
+                  'File komik tidak ditemukan di library',
+                  style: TextStyle(color: Colors.white),
+                ),
+                backgroundColor: const Color(0xFF4B5BAB),
                 behavior: SnackBarBehavior.floating,
                 action: SnackBarAction(
                   label: 'Hapus Riwayat',
-                  textColor: Colors.white,
+                  textColor: Colors.red,
                   onPressed: () async {
                     await ReadingHistoryService.removeEntry(entry.id);
                     _loadAll();

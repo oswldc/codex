@@ -218,23 +218,29 @@ class _LibraryPageState extends State<LibraryPage> {
             ),
           ),
         ),
-        child: BottomNavigationBar(
-          currentIndex: _selectedIndex,
-          backgroundColor: Theme.of(context).scaffoldBackgroundColor,
-          selectedItemColor: accentColor,
-          unselectedItemColor: Colors.white38,
-          onTap: (index) => setState(() => _selectedIndex = index),
-          items: const [
-            BottomNavigationBarItem(
-              icon: Icon(Icons.auto_stories),
-              label: 'Library',
-            ),
-            BottomNavigationBarItem(icon: Icon(Icons.history), label: 'Recent'),
-            BottomNavigationBarItem(
-              icon: Icon(Icons.settings),
-              label: 'Settings',
-            ),
-          ],
+        child: Theme(
+          data: Theme.of(context).copyWith(splashColor: Colors.transparent),
+          child: BottomNavigationBar(
+            currentIndex: _selectedIndex,
+            backgroundColor: Theme.of(context).scaffoldBackgroundColor,
+            selectedItemColor: accentColor,
+            unselectedItemColor: Colors.white38,
+            onTap: (index) => setState(() => _selectedIndex = index),
+            items: const [
+              BottomNavigationBarItem(
+                icon: Icon(Icons.auto_stories),
+                label: 'Library',
+              ),
+              BottomNavigationBarItem(
+                icon: Icon(Icons.history),
+                label: 'Recent',
+              ),
+              BottomNavigationBarItem(
+                icon: Icon(Icons.settings),
+                label: 'Settings',
+              ),
+            ],
+          ),
         ),
       ),
     );
