@@ -22,57 +22,52 @@ class _ReaderPageState extends State<ReaderPage> {
   bool _showUI = true;
   int _currentPage = 1;
   int _totalPages = -1;
+
+  // For CBZ/CBR: all pages loaded upfront (already fast via ComicService)
   List<Uint8List> _localPages = [];
+
+  // For PDF: lazy per-page cache + shared document
+  PdfDocument? _pdfDocument;
+  final Map<int, Uint8List> _pdfPageCache = {};
+  final Set<int> _pdfPagesRendering = {};
+
   bool _isLoading = false;
   String _loadingMessage = 'Preparing your comic...';
   ReadingMode _readingMode = ReadingMode.horizontal;
 
-  // PDF controller — hanya diinisialisasi jika fileType == pdf
-  PdfControllerPinch? _pdfController;
-
   late PageController _pageController;
+
+  bool get _isPdf => widget.comic.fileType == ComicFileType.pdf;
 
   @override
   void initState() {
     super.initState();
     _isLoading = true;
+    _pageController = PageController();
 
     final double initialProgress = widget.comic.progress;
     final int savedPage =
         (widget.comic.currentPage ?? 0) > 0 ? widget.comic.currentPage! : 1;
 
-    // Inisialisasi PDF controller jika perlu
-    if (widget.comic.fileType == ComicFileType.pdf &&
-        widget.comic.localPath != null) {
-      _pdfController = PdfControllerPinch(
-        document: PdfDocument.openFile(widget.comic.localPath!),
-        initialPage: savedPage,
-      );
-    }
-
-    _pageController = PageController();
-
     WidgetsBinding.instance.addPostFrameCallback((_) async {
       try {
         if (!mounted) return;
 
-        if (widget.comic.fileType == ComicFileType.pdf) {
-          // PDF: loading ditangani oleh PdfViewPinch sendiri
-          if (mounted) setState(() => _isLoading = false);
-          return;
-        }
-
         int total = -1;
-        List<Uint8List> localPages = [];
 
-        if ((widget.comic.fileType == ComicFileType.cbz ||
+        if (_isPdf && widget.comic.localPath != null) {
+          // Open the document once; keep it alive for lazy rendering
+          setState(() => _loadingMessage = 'Opening PDF...');
+          _pdfDocument = await PdfDocument.openFile(widget.comic.localPath!);
+          total = _pdfDocument!.pagesCount;
+        } else if ((widget.comic.fileType == ComicFileType.cbz ||
                 widget.comic.fileType == ComicFileType.cbr) &&
             widget.comic.localPath != null) {
           setState(() => _loadingMessage = 'Extracting pages...');
-          localPages = await ComicService.getPagesFromCBZ(
+          _localPages = await ComicService.getPagesFromCBZ(
             widget.comic.localPath!,
           );
-          total = localPages.length;
+          total = _localPages.length;
         } else if (widget.comic.pages.isNotEmpty) {
           total = widget.comic.pages.length;
         }
@@ -80,7 +75,7 @@ class _ReaderPageState extends State<ReaderPage> {
         if (total > 0) {
           int targetPage = (initialProgress * total).round().clamp(1, total);
           if ((widget.comic.currentPage ?? 0) > 0) {
-            targetPage = widget.comic.currentPage!.clamp(1, total);
+            targetPage = savedPage.clamp(1, total);
           }
 
           _pageController.dispose();
@@ -88,12 +83,14 @@ class _ReaderPageState extends State<ReaderPage> {
 
           if (mounted) {
             setState(() {
-              _localPages = localPages;
               _totalPages = total;
               _currentPage = targetPage;
               _isLoading = false;
             });
           }
+
+          // Pre-render current page + neighbours without blocking the UI
+          if (_isPdf) _preRenderAround(targetPage);
         } else {
           if (mounted) {
             setState(() {
@@ -109,19 +106,63 @@ class _ReaderPageState extends State<ReaderPage> {
     });
   }
 
-  void _jumpToPage(int page) {
-    if (widget.comic.fileType == ComicFileType.pdf) {
-      _pdfController?.animateToPage(
-        pageNumber: page,
-        duration: const Duration(milliseconds: 300),
-        curve: Curves.easeInOut,
-      );
-    } else {
-      if (_pageController.hasClients) {
-        _pageController.jumpToPage(page - 1);
-      }
+  // ── PDF lazy rendering ────────────────────────────────────────────────────
+
+  /// Queue rendering for [page] and its immediate neighbours (±2).
+  void _preRenderAround(int page) {
+    const int radius = 2;
+    final int first = (page - radius).clamp(1, _totalPages);
+    final int last = (page + radius).clamp(1, _totalPages);
+    for (int p = first; p <= last; p++) {
+      _ensurePageRendered(p);
     }
   }
+
+  /// Render a single PDF page into [_pdfPageCache] if not already cached or
+  /// currently in-flight. Fire-and-forget: callers don't await this.
+  Future<void> _ensurePageRendered(int pageNumber) async {
+    if (_pdfDocument == null) return;
+    if (_pdfPageCache.containsKey(pageNumber)) return;
+    if (_pdfPagesRendering.contains(pageNumber)) return;
+
+    _pdfPagesRendering.add(pageNumber);
+    try {
+      final PdfPage page = await _pdfDocument!.getPage(pageNumber);
+      final PdfPageImage? image = await page.render(
+        width: page.width * 2, // 2× for crisp hi-DPI rendering
+        height: page.height * 2,
+        format: PdfPageImageFormat.png,
+        backgroundColor: '#FFFFFF',
+      );
+      await page.close();
+
+      if (image != null && mounted) {
+        _pdfPageCache[pageNumber] = image.bytes;
+        setState(() {}); // Refresh the specific page item
+      }
+    } catch (e) {
+      debugPrint('PDF render error (page $pageNumber): $e');
+    } finally {
+      _pdfPagesRendering.remove(pageNumber);
+    }
+  }
+
+  // ── Navigation ────────────────────────────────────────────────────────────
+
+  void _onPageChanged(int index) {
+    final int page = index + 1;
+    setState(() => _currentPage = page);
+    if (_isPdf) _preRenderAround(page);
+  }
+
+  void _jumpToPage(int page) {
+    if (_pageController.hasClients) {
+      _pageController.jumpToPage(page - 1);
+    }
+    if (_isPdf) _preRenderAround(page);
+  }
+
+  // ── Lifecycle ─────────────────────────────────────────────────────────────
 
   @override
   void dispose() {
@@ -148,9 +189,11 @@ class _ReaderPageState extends State<ReaderPage> {
     );
 
     _pageController.dispose();
-    _pdfController?.dispose();
+    _pdfDocument?.close(); // Close the shared PdfDocument
     super.dispose();
   }
+
+  // ── Build ─────────────────────────────────────────────────────────────────
 
   @override
   Widget build(BuildContext context) {
@@ -190,9 +233,7 @@ class _ReaderPageState extends State<ReaderPage> {
       height: double.infinity,
       child: Stack(
         children: [
-          if (!_isLoading &&
-              (_totalPages > 0 || widget.comic.fileType == ComicFileType.pdf))
-            _buildMainContent(primaryColor),
+          if (!_isLoading && _totalPages > 0) _buildMainContent(primaryColor),
           if (!_isLoading && _totalPages == 0)
             Center(
               child: Column(
@@ -239,44 +280,9 @@ class _ReaderPageState extends State<ReaderPage> {
     );
   }
 
+  /// Unified PageView for all formats. PDF pages are served from
+  /// [_pdfPageCache] and rendered on demand; a spinner shows while waiting.
   Widget _buildMainContent(Color primaryColor) {
-    // ── PDF ──────────────────────────────────────────────────────────────────
-    if (widget.comic.fileType == ComicFileType.pdf &&
-        widget.comic.localPath != null &&
-        _pdfController != null) {
-      return PdfViewPinch(
-        controller: _pdfController!,
-        onPageChanged: (page) {
-          if (mounted) setState(() => _currentPage = page);
-        },
-        onDocumentLoaded: (document) {
-          if (mounted) {
-            setState(() => _totalPages = document.pagesCount);
-          }
-        },
-        onDocumentError: (error) {
-          debugPrint('PDF load error: $error');
-        },
-        builders: PdfViewPinchBuilders<DefaultBuilderOptions>(
-          options: const DefaultBuilderOptions(),
-          documentLoaderBuilder:
-              (_) =>
-                  Center(child: CircularProgressIndicator(color: primaryColor)),
-          pageLoaderBuilder:
-              (_) =>
-                  Center(child: CircularProgressIndicator(color: primaryColor)),
-          errorBuilder:
-              (_, error) => Center(
-                child: Text(
-                  'Gagal memuat PDF: $error',
-                  style: const TextStyle(color: Colors.white54),
-                ),
-              ),
-        ),
-      );
-    }
-
-    // ── CBZ / network pages ──────────────────────────────────────────────────
     return Container(
       color: Colors.black,
       child: InteractiveViewer(
@@ -290,11 +296,32 @@ class _ReaderPageState extends State<ReaderPage> {
                   : Axis.vertical,
           controller: _pageController,
           physics: const BouncingScrollPhysics(),
-          onPageChanged: (index) {
-            setState(() => _currentPage = index + 1);
-          },
+          onPageChanged: _onPageChanged,
           itemCount: _totalPages,
           itemBuilder: (context, index) {
+            final int pageNumber = index + 1;
+
+            // ── PDF: serve from cache, trigger render if missing ────────────
+            if (_isPdf) {
+              final Uint8List? cached = _pdfPageCache[pageNumber];
+              if (cached != null) {
+                return Center(
+                  child: Image.memory(
+                    cached,
+                    fit: BoxFit.contain,
+                    filterQuality: FilterQuality.medium,
+                    gaplessPlayback: true,
+                  ),
+                );
+              }
+              // Not yet in cache — kick off rendering and show a spinner
+              _ensurePageRendered(pageNumber);
+              return Center(
+                child: CircularProgressIndicator(color: primaryColor),
+              );
+            }
+
+            // ── CBZ / CBR (pre-loaded local bytes) ──────────────────────────
             if (_localPages.isNotEmpty && index < _localPages.length) {
               return Center(
                 child: Image.memory(
@@ -302,15 +329,15 @@ class _ReaderPageState extends State<ReaderPage> {
                   fit: BoxFit.contain,
                   filterQuality: FilterQuality.medium,
                   gaplessPlayback: true,
-                  errorBuilder: (context, error, stackTrace) {
-                    return const Center(
-                      child: Icon(Icons.broken_image, color: Colors.white24),
-                    );
-                  },
+                  errorBuilder:
+                      (context, error, stackTrace) => const Center(
+                        child: Icon(Icons.broken_image, color: Colors.white24),
+                      ),
                 ),
               );
             }
 
+            // ── Network pages ───────────────────────────────────────────────
             if (widget.comic.pages.isNotEmpty &&
                 index < widget.comic.pages.length) {
               return CachedNetworkImage(
@@ -320,18 +347,22 @@ class _ReaderPageState extends State<ReaderPage> {
                     (context, url) => Center(
                       child: CircularProgressIndicator(color: primaryColor),
                     ),
-                errorWidget: (context, url, error) => const Icon(Icons.error),
+                errorWidget:
+                    (context, url, error) =>
+                        const Icon(Icons.error, color: Colors.white24),
               );
             }
 
-            return const Center(
-              child: CircularProgressIndicator(color: Colors.white24),
+            return Center(
+              child: CircularProgressIndicator(color: primaryColor),
             );
           },
         ),
       ),
     );
   }
+
+  // ── Bars ──────────────────────────────────────────────────────────────────
 
   Widget _buildTopBar(BuildContext context) {
     return Container(
@@ -379,7 +410,9 @@ class _ReaderPageState extends State<ReaderPage> {
 
   Widget _buildBottomBar(BuildContext context) {
     final Color primaryColor = Theme.of(context).primaryColor;
-    final int displayTotal = _totalPages > 0 ? _totalPages : 1;
+    final bool ready = !_isLoading && _totalPages > 0;
+    final int displayTotal = ready ? _totalPages : 1;
+    final int displayCurrent = ready ? _currentPage.clamp(1, displayTotal) : 1;
 
     return Container(
       padding: const EdgeInsets.all(24),
@@ -401,7 +434,7 @@ class _ReaderPageState extends State<ReaderPage> {
               border: Border.all(color: Colors.white10),
             ),
             child: Text(
-              _totalPages > 0 ? '$_currentPage / $_totalPages' : 'Memuat...',
+              ready ? '$displayCurrent / $displayTotal' : 'Loading...',
               style: const TextStyle(
                 color: Colors.white,
                 fontWeight: FontWeight.bold,
@@ -417,35 +450,43 @@ class _ReaderPageState extends State<ReaderPage> {
               borderRadius: BorderRadius.circular(16),
               border: Border.all(color: Colors.white.withValues(alpha: 0.05)),
             ),
-            child: SliderTheme(
-              data: SliderTheme.of(context).copyWith(
-                trackHeight: 2,
-                thumbShape: const RoundSliderThumbShape(enabledThumbRadius: 6),
-                overlayShape: const RoundSliderOverlayShape(overlayRadius: 14),
-                activeTrackColor: primaryColor,
-                inactiveTrackColor: Colors.white10,
-                thumbColor: Colors.white,
-              ),
-              child: Slider(
-                value: _currentPage.toDouble().clamp(
-                  1,
-                  displayTotal.toDouble(),
-                ),
-                min: 1,
-                max: displayTotal.toDouble(),
-                onChanged: (value) {
-                  setState(() => _currentPage = value.toInt());
-                },
-                onChangeEnd: (value) {
-                  _jumpToPage(value.toInt());
-                },
-              ),
-            ),
+            child:
+                ready
+                    ? SliderTheme(
+                      data: SliderTheme.of(context).copyWith(
+                        trackHeight: 2,
+                        thumbShape: const RoundSliderThumbShape(
+                          enabledThumbRadius: 6,
+                        ),
+                        overlayShape: const RoundSliderOverlayShape(
+                          overlayRadius: 14,
+                        ),
+                        activeTrackColor: primaryColor,
+                        inactiveTrackColor: Colors.white10,
+                        thumbColor: Colors.white,
+                      ),
+                      child: Slider(
+                        value: displayCurrent.toDouble(),
+                        min: 1,
+                        max: displayTotal.toDouble(),
+                        onChanged: (value) {
+                          setState(() => _currentPage = value.toInt());
+                        },
+                        onChangeEnd: (value) {
+                          _jumpToPage(value.toInt());
+                        },
+                      ),
+                    )
+                    : const LinearProgressIndicator(
+                      backgroundColor: Colors.white10,
+                    ),
           ),
         ],
       ),
     );
   }
+
+  // ── Settings sheet ────────────────────────────────────────────────────────
 
   void _showSettings(BuildContext context) {
     showModalBottomSheet(
@@ -485,53 +526,44 @@ class _ReaderPageState extends State<ReaderPage> {
                     style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold),
                   ),
                   const SizedBox(height: 24),
-                  // Mode pilihan hanya untuk non-PDF
-                  if (widget.comic.fileType != ComicFileType.pdf) ...[
-                    const Text(
-                      'Reading Mode',
-                      style: TextStyle(
-                        color: Colors.white70,
-                        fontSize: 14,
-                        fontWeight: FontWeight.w500,
+                  const Text(
+                    'Reading Mode',
+                    style: TextStyle(
+                      color: Colors.white70,
+                      fontSize: 14,
+                      fontWeight: FontWeight.w500,
+                    ),
+                  ),
+                  const SizedBox(height: 12),
+                  Row(
+                    children: [
+                      Expanded(
+                        child: _buildModeButton(
+                          Icons.swap_horiz,
+                          'Page Flip',
+                          _readingMode == ReadingMode.horizontal,
+                          onTap: () {
+                            setState(
+                              () => _readingMode = ReadingMode.horizontal,
+                            );
+                            Navigator.pop(context);
+                          },
+                        ),
                       ),
-                    ),
-                    const SizedBox(height: 12),
-                    Row(
-                      children: [
-                        Expanded(
-                          child: _buildModeButton(
-                            Icons.swap_horiz,
-                            'Page Flip',
-                            _readingMode == ReadingMode.horizontal,
-                            onTap: () {
-                              setState(
-                                () => _readingMode = ReadingMode.horizontal,
-                              );
-                              Navigator.pop(context);
-                            },
-                          ),
+                      const SizedBox(width: 12),
+                      Expanded(
+                        child: _buildModeButton(
+                          Icons.view_headline,
+                          'Vertical',
+                          _readingMode == ReadingMode.vertical,
+                          onTap: () {
+                            setState(() => _readingMode = ReadingMode.vertical);
+                            Navigator.pop(context);
+                          },
                         ),
-                        const SizedBox(width: 12),
-                        Expanded(
-                          child: _buildModeButton(
-                            Icons.view_headline,
-                            'Vertical',
-                            _readingMode == ReadingMode.vertical,
-                            onTap: () {
-                              setState(
-                                () => _readingMode = ReadingMode.vertical,
-                              );
-                              Navigator.pop(context);
-                            },
-                          ),
-                        ),
-                      ],
-                    ),
-                  ] else
-                    const Text(
-                      'PDF menggunakan mode pinch-to-zoom bawaan.',
-                      style: TextStyle(color: Colors.white38, fontSize: 13),
-                    ),
+                      ),
+                    ],
+                  ),
                   const SizedBox(height: 24),
                 ],
               ),
@@ -539,6 +571,8 @@ class _ReaderPageState extends State<ReaderPage> {
           ),
     );
   }
+
+  // ── Small widgets ─────────────────────────────────────────────────────────
 
   Widget _buildModeButton(
     IconData icon,
