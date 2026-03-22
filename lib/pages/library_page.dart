@@ -6,6 +6,8 @@ import '../services/comic_service.dart';
 import 'comic_detail_page.dart';
 import 'recent_page.dart';
 
+enum ViewMode { grid, gridSmall, list }
+
 class LibraryPage extends StatefulWidget {
   const LibraryPage({super.key});
 
@@ -18,6 +20,7 @@ class _LibraryPageState extends State<LibraryPage> {
   final List<Comic> _allComics = [];
   List<Comic> _filteredComics = [];
   bool _isLoading = false;
+  ViewMode _viewMode = ViewMode.grid;
   final TextEditingController _searchController = TextEditingController();
   final FocusNode _searchFocusNode = FocusNode();
 
@@ -50,7 +53,7 @@ class _LibraryPageState extends State<LibraryPage> {
     });
   }
 
-  // ─── Core fetch (tanpa guard, selalu jalan) ───────────────────────────────
+  // ─── Core fetch ───────────────────────────────────────────────────────────
 
   Future<void> _fetchComics() async {
     final comics = await ComicService.syncWithFolder();
@@ -65,7 +68,7 @@ class _LibraryPageState extends State<LibraryPage> {
     }
   }
 
-  // ─── Load dengan spinner (untuk refresh manual / initState) ───────────────
+  // ─── Load dengan spinner ──────────────────────────────────────────────────
 
   Future<void> _loadSavedComics() async {
     if (_isLoading) return;
@@ -119,7 +122,6 @@ class _LibraryPageState extends State<LibraryPage> {
 
     if (result == null || result == 'cancel') return;
     await ComicService.deleteComic(comic, deleteFile: result == 'delete');
-    // ✅ Pakai _loadSavedComics biasa setelah delete
     await _loadSavedComics();
   }
 
@@ -127,7 +129,6 @@ class _LibraryPageState extends State<LibraryPage> {
 
   Future<void> _addLocalComics() async {
     try {
-      // ✅ Buka file picker DULU — tidak set loading dulu
       final newComics = await ComicService.pickAndParseComics();
 
       if (!mounted) return;
@@ -142,8 +143,6 @@ class _LibraryPageState extends State<LibraryPage> {
         return;
       }
 
-      // ✅ Set loading lalu langsung fetch — TANPA memanggil _loadSavedComics
-      // agar tidak terkena guard "if (_isLoading) return"
       setState(() => _isLoading = true);
       try {
         await _fetchComics();
@@ -279,6 +278,7 @@ class _LibraryPageState extends State<LibraryPage> {
                   overflow: TextOverflow.ellipsis,
                 ),
               ),
+              // ← Loading indicator (hanya tampil saat loading, tanpa refresh button)
               if (_isLoading)
                 const Padding(
                   padding: EdgeInsets.all(12),
@@ -287,12 +287,33 @@ class _LibraryPageState extends State<LibraryPage> {
                     height: 20,
                     child: CircularProgressIndicator(strokeWidth: 2),
                   ),
-                )
-              else
+                ),
+              // ← Toggle view mode (grid → gridSmall → list → grid)
+              if (_selectedIndex == 0)
                 IconButton(
-                  onPressed: _loadSavedComics,
-                  icon: const Icon(Icons.refresh, color: Colors.white70),
-                  tooltip: 'Refresh',
+                  onPressed: () {
+                    setState(() {
+                      _viewMode = switch (_viewMode) {
+                        ViewMode.grid => ViewMode.gridSmall,
+                        ViewMode.gridSmall => ViewMode.list,
+                        ViewMode.list => ViewMode.grid,
+                      };
+                    });
+                  },
+                  icon: Icon(switch (_viewMode) {
+                    ViewMode.grid =>
+                      Icons
+                          .grid_on_rounded, // aktif: grid besar → next: grid kecil
+                    ViewMode.gridSmall =>
+                      Icons.view_list_rounded, // aktif: grid kecil → next: list
+                    ViewMode.list =>
+                      Icons.grid_view_rounded, // aktif: list → next: grid besar
+                  }, color: Colors.white70),
+                  tooltip: switch (_viewMode) {
+                    ViewMode.grid => 'Beralih ke grid kecil',
+                    ViewMode.gridSmall => 'Beralih ke list',
+                    ViewMode.list => 'Beralih ke grid besar',
+                  },
                 ),
             ],
           ),
@@ -389,51 +410,95 @@ class _LibraryPageState extends State<LibraryPage> {
       behavior: HitTestBehavior.translucent,
       child: RefreshIndicator(
         onRefresh: _loadSavedComics,
-        child: GridView.builder(
-          padding: const EdgeInsets.all(16),
-          gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
-            crossAxisCount: 2,
-            childAspectRatio: 0.6,
-            crossAxisSpacing: 16,
-            mainAxisSpacing: 24,
-          ),
-          itemCount: _filteredComics.length,
-          itemBuilder: (context, index) {
-            final comic = _filteredComics[index];
-            return ComicCard(
-              comic: comic,
-              onTap: () async {
-                _searchFocusNode.unfocus();
-                FocusScope.of(context).unfocus();
-                await Navigator.push(
-                  context,
-                  MaterialPageRoute(
-                    builder: (context) => ComicDetailPage(comic: comic),
-                  ),
-                );
-                await _loadSavedComics();
-              },
-              onDelete: () => _deleteComic(comic),
-            );
-          },
-        ),
+        child: switch (_viewMode) {
+          ViewMode.grid => _buildGridView(context, crossAxisCount: 2),
+          ViewMode.gridSmall => _buildGridView(context, crossAxisCount: 3),
+          ViewMode.list => _buildListView(context),
+        },
       ),
+    );
+  }
+
+  // ─── Grid View ────────────────────────────────────────────────────────────
+
+  Widget _buildGridView(BuildContext context, {int crossAxisCount = 2}) {
+    final isSmall = crossAxisCount >= 3;
+    return GridView.builder(
+      padding: EdgeInsets.all(isSmall ? 12 : 16),
+      gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
+        crossAxisCount: crossAxisCount,
+        childAspectRatio: isSmall ? 0.55 : 0.6,
+        crossAxisSpacing: isSmall ? 10 : 16,
+        mainAxisSpacing: isSmall ? 16 : 24,
+      ),
+      itemCount: _filteredComics.length,
+      itemBuilder: (context, index) {
+        final comic = _filteredComics[index];
+        return ComicCard(
+          comic: comic,
+          isSmall: isSmall,
+          onTap: () async {
+            _searchFocusNode.unfocus();
+            FocusScope.of(context).unfocus();
+            await Navigator.push(
+              context,
+              MaterialPageRoute(
+                builder: (context) => ComicDetailPage(comic: comic),
+              ),
+            );
+            await _loadSavedComics();
+          },
+          onDelete: () => _deleteComic(comic),
+        );
+      },
+    );
+  }
+
+  // ─── List View ────────────────────────────────────────────────────────────
+
+  Widget _buildListView(BuildContext context) {
+    final Color primaryColor = Theme.of(context).primaryColor;
+
+    return ListView.builder(
+      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+      itemCount: _filteredComics.length,
+      itemBuilder: (context, index) {
+        final comic = _filteredComics[index];
+        return ComicListTile(
+          comic: comic,
+          primaryColor: primaryColor,
+          onTap: () async {
+            _searchFocusNode.unfocus();
+            FocusScope.of(context).unfocus();
+            await Navigator.push(
+              context,
+              MaterialPageRoute(
+                builder: (context) => ComicDetailPage(comic: comic),
+              ),
+            );
+            await _loadSavedComics();
+          },
+          onDelete: () => _deleteComic(comic),
+        );
+      },
     );
   }
 }
 
-// ─── Comic Card ───────────────────────────────────────────────────────────────
+// ─── Comic Card (Grid) ────────────────────────────────────────────────────────
 
 class ComicCard extends StatelessWidget {
   final Comic comic;
   final VoidCallback onTap;
   final VoidCallback onDelete;
+  final bool isSmall;
 
   const ComicCard({
     super.key,
     required this.comic,
     required this.onTap,
     required this.onDelete,
+    this.isSmall = false,
   });
 
   @override
@@ -557,18 +622,23 @@ class ComicCard extends StatelessWidget {
             comic.title,
             maxLines: 1,
             overflow: TextOverflow.ellipsis,
-            style: const TextStyle(fontSize: 14, fontWeight: FontWeight.w600),
+            style: TextStyle(
+              fontSize: isSmall ? 11 : 14,
+              fontWeight: FontWeight.w600,
+            ),
           ),
-          const SizedBox(height: 2),
-          Text(
-            [
-              comic.subtitle,
-              if (comic.genre.isNotEmpty) comic.genre,
-            ].join(' • '),
-            style: const TextStyle(fontSize: 12, color: Colors.white38),
-            maxLines: 1,
-            overflow: TextOverflow.ellipsis,
-          ),
+          if (!isSmall) ...[
+            const SizedBox(height: 2),
+            Text(
+              [
+                comic.subtitle,
+                if (comic.genre.isNotEmpty) comic.genre,
+              ].join(' • '),
+              style: const TextStyle(fontSize: 12, color: Colors.white38),
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+            ),
+          ],
         ],
       ),
     );
@@ -597,6 +667,178 @@ class ComicCard extends StatelessWidget {
       color: Colors.white10,
       child: const Center(
         child: Icon(Icons.book, size: 48, color: Colors.white24),
+      ),
+    );
+  }
+}
+
+// ─── Comic List Tile (List View) ──────────────────────────────────────────────
+
+class ComicListTile extends StatelessWidget {
+  final Comic comic;
+  final Color primaryColor;
+  final VoidCallback onTap;
+  final VoidCallback onDelete;
+
+  const ComicListTile({
+    super.key,
+    required this.comic,
+    required this.primaryColor,
+    required this.onTap,
+    required this.onDelete,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 6),
+      child: InkWell(
+        onTap: onTap,
+        borderRadius: BorderRadius.circular(12),
+        child: Container(
+          height: 88,
+          decoration: BoxDecoration(
+            color: primaryColor.withValues(alpha: 0.06),
+            borderRadius: BorderRadius.circular(12),
+            border: Border.all(color: Colors.white10, width: 0.5),
+          ),
+          child: Row(
+            children: [
+              // Thumbnail
+              ClipRRect(
+                borderRadius: const BorderRadius.only(
+                  topLeft: Radius.circular(12),
+                  bottomLeft: Radius.circular(12),
+                ),
+                child: SizedBox(width: 60, height: 88, child: _buildCover()),
+              ),
+              // Info
+              Expanded(
+                child: Padding(
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 12,
+                    vertical: 10,
+                  ),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    mainAxisAlignment: MainAxisAlignment.center,
+                    children: [
+                      Text(
+                        comic.title,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: const TextStyle(
+                          fontSize: 14,
+                          fontWeight: FontWeight.w600,
+                        ),
+                      ),
+                      const SizedBox(height: 3),
+                      Text(
+                        [
+                          comic.subtitle,
+                          if (comic.genre.isNotEmpty) comic.genre,
+                        ].join(' • '),
+                        style: const TextStyle(
+                          fontSize: 12,
+                          color: Colors.white38,
+                        ),
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                      ),
+                      const SizedBox(height: 8),
+                      // Progress bar
+                      ClipRRect(
+                        borderRadius: BorderRadius.circular(2),
+                        child: LinearProgressIndicator(
+                          value: comic.progress.clamp(0.0, 1.0),
+                          minHeight: 3,
+                          backgroundColor: Colors.white12,
+                          valueColor: AlwaysStoppedAnimation<Color>(
+                            comic.progress >= 1.0 ? Colors.green : primaryColor,
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+              // Badge + delete
+              Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 8),
+                child: Column(
+                  mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+                  children: [
+                    Container(
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 6,
+                        vertical: 3,
+                      ),
+                      decoration: BoxDecoration(
+                        color:
+                            comic.progress >= 1.0 ? Colors.green : primaryColor,
+                        borderRadius: BorderRadius.circular(4),
+                      ),
+                      child: Text(
+                        comic.progress >= 1.0
+                            ? 'DONE'
+                            : '${(comic.progress * 100).toInt()}%',
+                        style: const TextStyle(
+                          color: Colors.white,
+                          fontSize: 10,
+                          fontWeight: FontWeight.bold,
+                        ),
+                      ),
+                    ),
+                    InkWell(
+                      onTap: onDelete,
+                      borderRadius: BorderRadius.circular(20),
+                      child: Container(
+                        padding: const EdgeInsets.all(6),
+                        decoration: BoxDecoration(
+                          color: Colors.black26,
+                          shape: BoxShape.circle,
+                          border: Border.all(color: Colors.white10),
+                        ),
+                        child: const Icon(
+                          Icons.delete_outline,
+                          size: 16,
+                          color: Colors.redAccent,
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildCover() {
+    if (comic.source == ComicSource.local && comic.thumbnailPath != null) {
+      final file = File(comic.thumbnailPath!);
+      if (file.existsSync()) {
+        return Image.file(file, fit: BoxFit.cover);
+      }
+    }
+    if (comic.imageUrl.isNotEmpty) {
+      return CachedNetworkImage(
+        imageUrl: comic.imageUrl,
+        fit: BoxFit.cover,
+        placeholder: (context, url) => Container(color: Colors.white10),
+        errorWidget: (context, url, error) => _placeholder(),
+      );
+    }
+    return _placeholder();
+  }
+
+  Widget _placeholder() {
+    return Container(
+      color: Colors.white10,
+      child: const Center(
+        child: Icon(Icons.book, size: 24, color: Colors.white24),
       ),
     );
   }
