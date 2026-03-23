@@ -6,11 +6,6 @@ import '../models/comic.dart';
 import '../services/comic_service.dart';
 import 'reader_page.dart';
 
-/// Pengganti ComicDetailPage lama.
-/// Tetap menerima [Comic] sebagai parameter agar semua pemanggil lama
-/// (library_page, recent_page, dll) tidak perlu diubah.
-/// Di dalamnya, Comic di-convert ke ComicSeries lalu ditampilkan
-/// dengan tampilan series + daftar semua volume.
 class ComicDetailPage extends StatefulWidget {
   final Comic comic;
 
@@ -30,7 +25,6 @@ class _ComicDetailPageState extends State<ComicDetailPage> {
     _refreshSeries();
   }
 
-  /// Buat ComicSeries sementara dari satu Comic (untuk inisialisasi awal)
   ComicSeries _seriesFromComic(Comic comic) {
     return ComicSeries(seriesTitle: comic.seriesTitle, volumes: [comic]);
   }
@@ -42,9 +36,7 @@ class _ComicDetailPageState extends State<ComicDetailPage> {
       (s) => s.seriesTitle == _currentSeries.seriesTitle,
       orElse: () => _currentSeries,
     );
-    if (mounted) {
-      setState(() => _currentSeries = updated);
-    }
+    if (mounted) setState(() => _currentSeries = updated);
   }
 
   Future<void> _openVolume(Comic comic) async {
@@ -88,10 +80,257 @@ class _ComicDetailPageState extends State<ComicDetailPage> {
     await ComicService.deleteComic(comic, deleteFile: result == 'delete');
     await _refreshSeries();
 
-    // Kalau semua volume sudah dihapus, kembali ke library
-    if (_currentSeries.volumes.isEmpty && mounted) {
-      Navigator.pop(context);
+    if (_currentSeries.volumes.isEmpty && mounted) Navigator.pop(context);
+  }
+
+  // ─── More menu ────────────────────────────────────────────────────────────
+
+  void _showMoreMenu(BuildContext context) {
+    showModalBottomSheet(
+      context: context,
+      backgroundColor: Colors.transparent,
+      builder:
+          (ctx) => Container(
+            decoration: BoxDecoration(
+              color: Theme.of(context).scaffoldBackgroundColor,
+              borderRadius: const BorderRadius.vertical(
+                top: Radius.circular(20),
+              ),
+              border: Border.all(color: Colors.white10),
+            ),
+            padding: const EdgeInsets.fromLTRB(24, 16, 24, 32),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                // Handle bar
+                Container(
+                  width: 40,
+                  height: 4,
+                  margin: const EdgeInsets.only(bottom: 20),
+                  decoration: BoxDecoration(
+                    color: Colors.white24,
+                    borderRadius: BorderRadius.circular(2),
+                  ),
+                ),
+                // Judul series
+                Text(
+                  _currentSeries.seriesTitle,
+                  style: const TextStyle(
+                    fontWeight: FontWeight.bold,
+                    fontSize: 16,
+                  ),
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                ),
+                const SizedBox(height: 20),
+
+                _buildMenuItem(
+                  icon: Icons.edit_outlined,
+                  label: 'Edit judul series',
+                  color: Colors.white,
+                  onTap: () {
+                    Navigator.pop(ctx);
+                    _showEditTitleDialog(context);
+                  },
+                ),
+                _buildMenuItem(
+                  icon: Icons.check_circle_outline,
+                  label: 'Tandai semua selesai',
+                  color: const Color(0xFFCFFF70),
+                  onTap: () async {
+                    Navigator.pop(ctx);
+                    await _markAllAs(1.0);
+                  },
+                ),
+                _buildMenuItem(
+                  icon: Icons.radio_button_unchecked,
+                  label: 'Tandai semua belum dibaca',
+                  color: Colors.white70,
+                  onTap: () async {
+                    Navigator.pop(ctx);
+                    await _markAllAs(0.0);
+                  },
+                ),
+
+                const Divider(color: Colors.white10, height: 24),
+
+                _buildMenuItem(
+                  icon: Icons.delete_outline,
+                  label: 'Hapus series',
+                  color: Colors.redAccent,
+                  onTap: () {
+                    Navigator.pop(ctx);
+                    _confirmDeleteSeries(context);
+                  },
+                ),
+              ],
+            ),
+          ),
+    );
+  }
+
+  Widget _buildMenuItem({
+    required IconData icon,
+    required String label,
+    required Color color,
+    required VoidCallback onTap,
+  }) {
+    return InkWell(
+      onTap: onTap,
+      borderRadius: BorderRadius.circular(12),
+      child: Padding(
+        padding: const EdgeInsets.symmetric(vertical: 12, horizontal: 4),
+        child: Row(
+          children: [
+            Icon(icon, size: 22, color: color),
+            const SizedBox(width: 16),
+            Text(label, style: TextStyle(fontSize: 15, color: color)),
+          ],
+        ),
+      ),
+    );
+  }
+
+  // ─── Edit judul series ────────────────────────────────────────────────────
+
+  void _showEditTitleDialog(BuildContext context) {
+    final controller = TextEditingController(text: _currentSeries.seriesTitle);
+    showDialog(
+      context: context,
+      builder:
+          (ctx) => AlertDialog(
+            title: const Text('Edit Judul Series'),
+            content: TextField(
+              controller: controller,
+              autofocus: true,
+              decoration: const InputDecoration(hintText: 'Judul series'),
+              textCapitalization: TextCapitalization.words,
+            ),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.pop(ctx),
+                child: const Text('Batal'),
+              ),
+              TextButton(
+                onPressed: () async {
+                  final newTitle = controller.text.trim();
+                  if (newTitle.isEmpty ||
+                      newTitle == _currentSeries.seriesTitle) {
+                    Navigator.pop(ctx);
+                    return;
+                  }
+                  Navigator.pop(ctx);
+                  await _renameSeriesTitle(newTitle);
+                },
+                child: const Text('Simpan'),
+              ),
+            ],
+          ),
+    );
+  }
+
+  Future<void> _renameSeriesTitle(String newTitle) async {
+    final comics = await ComicService.loadComics();
+    final updated =
+        comics.map((c) {
+          if (c.seriesTitle == _currentSeries.seriesTitle) {
+            return Comic(
+              id: c.id,
+              title: c.title,
+              subtitle: c.subtitle,
+              imageUrl: c.imageUrl,
+              coverBytes: c.coverBytes,
+              thumbnailPath: c.thumbnailPath,
+              progress: c.progress,
+              genre: c.genre,
+              publisher: c.publisher,
+              releaseYear: c.releaseYear,
+              writer: c.writer,
+              artist: c.artist,
+              description: c.description,
+              pages: c.pages,
+              localPath: c.localPath,
+              source: c.source,
+              fileType: c.fileType,
+              lastRead: c.lastRead,
+              currentPage: c.currentPage,
+              totalPages: c.totalPages,
+              seriesTitle: newTitle,
+              volumeNumber: c.volumeNumber,
+            );
+          }
+          return c;
+        }).toList();
+    await ComicService.saveComics(updated);
+    await _refreshSeries();
+  }
+
+  // ─── Tandai progress semua volume ─────────────────────────────────────────
+
+  Future<void> _markAllAs(double progress) async {
+    for (final comic in _currentSeries.volumes) {
+      await ComicService.updateComicProgress(
+        comic.id,
+        progress,
+        currentPage: progress == 0.0 ? 0 : comic.totalPages,
+        totalPages: comic.totalPages,
+      );
     }
+    await _refreshSeries();
+    if (mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            progress >= 1.0
+                ? 'Semua volume ditandai selesai'
+                : 'Semua volume ditandai belum dibaca',
+          ),
+          backgroundColor:
+              progress >= 1.0 ? const Color(0xFF4CAF50) : Colors.blueGrey,
+          behavior: SnackBarBehavior.floating,
+        ),
+      );
+    }
+  }
+
+  // ─── Hapus series ──────────────────────────────────────────────────────────
+
+  Future<void> _confirmDeleteSeries(BuildContext context) async {
+    final result = await showDialog<String>(
+      context: context,
+      builder:
+          (ctx) => AlertDialog(
+            title: const Text('Hapus Series'),
+            content: Text(
+              'Hapus "${_currentSeries.seriesTitle}" beserta '
+              '${_currentSeries.volumeCount} volume?',
+            ),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.pop(ctx, 'cancel'),
+                child: const Text('Batal'),
+              ),
+              TextButton(
+                onPressed: () => Navigator.pop(ctx, 'library'),
+                child: const Text('Hapus dari library'),
+              ),
+              TextButton(
+                onPressed: () => Navigator.pop(ctx, 'delete'),
+                child: const Text(
+                  'Hapus file',
+                  style: TextStyle(color: Colors.redAccent),
+                ),
+              ),
+            ],
+          ),
+    );
+
+    if (result == null || result == 'cancel') return;
+    await ComicService.deleteSeries(
+      _currentSeries,
+      deleteFiles: result == 'delete',
+    );
+    if (mounted) Navigator.pop(context);
   }
 
   @override
@@ -103,159 +342,215 @@ class _ComicDetailPageState extends State<ComicDetailPage> {
     return Scaffold(
       body: Stack(
         children: [
-          // ─── Background blurred cover ──────────────────────────────────
-          SizedBox(
-            height: MediaQuery.of(context).size.height * 0.5,
-            width: double.infinity,
-            child: Stack(
-              fit: StackFit.expand,
-              children: [
-                _buildCoverImage(representative, fit: BoxFit.cover),
-                BackdropFilter(
-                  filter: ImageFilter.blur(sigmaX: 20, sigmaY: 20),
-                  child: Container(
-                    decoration: BoxDecoration(
-                      gradient: LinearGradient(
-                        begin: Alignment.topCenter,
-                        end: Alignment.bottomCenter,
-                        colors: [
-                          Colors.black.withValues(alpha: 0.3),
-                          Theme.of(context).scaffoldBackgroundColor,
+          // ─── Scrollable content ──────────────────────────────────────────
+          RefreshIndicator(
+            onRefresh: _refreshSeries,
+            child: CustomScrollView(
+              slivers: [
+                // ─── Header: overlay gradient tipis di atas scaffold solid ───────
+                SliverToBoxAdapter(
+                  child: Stack(
+                    children: [
+                      // Base solid — tidak ada garis transisi ke konten di bawah
+                      Positioned.fill(
+                        child: Container(
+                          color: Theme.of(context).scaffoldBackgroundColor,
+                        ),
+                      ),
+                      // Overlay gradient hanya di area atas (app bar)
+                      Positioned(
+                        top: 0,
+                        left: 0,
+                        right: 0,
+                        height: 200,
+                        child: Container(
+                          decoration: BoxDecoration(
+                            gradient: LinearGradient(
+                              begin: Alignment.topCenter,
+                              end: Alignment.bottomCenter,
+                              colors: [
+                                primaryColor.withValues(alpha: 0.22),
+                                primaryColor.withValues(alpha: 0.0),
+                              ],
+                            ),
+                          ),
+                        ),
+                      ),
+                      Column(
+                        children: [
+                          const SizedBox(height: 100),
+
+                          // Cover di tengah
+                          Center(
+                            child: Container(
+                              width: 150,
+                              height: 150 / 0.65,
+                              decoration: BoxDecoration(
+                                borderRadius: BorderRadius.circular(12),
+                                boxShadow: [
+                                  BoxShadow(
+                                    color: Colors.black.withValues(alpha: 0.5),
+                                    blurRadius: 16,
+                                    offset: const Offset(0, 8),
+                                  ),
+                                ],
+                              ),
+                              child: ClipRRect(
+                                borderRadius: BorderRadius.circular(12),
+                                child: _buildCoverImage(representative),
+                              ),
+                            ),
+                          ),
+
+                          const SizedBox(height: 20),
+
+                          // Info di bawah cover, rata tengah
+                          Padding(
+                            padding: const EdgeInsets.symmetric(horizontal: 24),
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.center,
+                              children: [
+                                Text(
+                                  _currentSeries.seriesTitle,
+                                  textAlign: TextAlign.center,
+                                  style: const TextStyle(
+                                    fontSize: 22,
+                                    fontWeight: FontWeight.bold,
+                                    height: 1.2,
+                                  ),
+                                ),
+                                if (representative.writer != null) ...[
+                                  const SizedBox(height: 5),
+                                  Text(
+                                    representative.writer!,
+                                    style: TextStyle(
+                                      fontSize: 13,
+                                      color: primaryColor.withValues(
+                                        alpha: 0.85,
+                                      ),
+                                    ),
+                                  ),
+                                ],
+                                const SizedBox(height: 10),
+                                Wrap(
+                                  spacing: 6,
+                                  runSpacing: 6,
+                                  alignment: WrapAlignment.center,
+                                  children: [
+                                    _buildChip(
+                                      representative.fileType
+                                          .toString()
+                                          .split('.')
+                                          .last
+                                          .toUpperCase(),
+                                      primaryColor,
+                                    ),
+                                    _buildChip('LOCAL', Colors.white24),
+                                    if (representative.genre.isNotEmpty &&
+                                        representative.genre != 'Local File')
+                                      _buildChip(
+                                        representative.genre,
+                                        Colors.white24,
+                                      ),
+                                  ],
+                                ),
+                                const SizedBox(height: 10),
+                                Row(
+                                  mainAxisAlignment: MainAxisAlignment.center,
+                                  children: [
+                                    Icon(
+                                      Icons.auto_stories,
+                                      size: 13,
+                                      color: primaryColor,
+                                    ),
+                                    const SizedBox(width: 5),
+                                    Text(
+                                      _currentSeries.averageProgress > 0
+                                          ? '${(_currentSeries.averageProgress * 100).toInt()}% dibaca'
+                                          : 'Belum dibaca',
+                                      style: const TextStyle(
+                                        fontSize: 12,
+                                        color: Colors.white54,
+                                      ),
+                                    ),
+                                  ],
+                                ),
+                              ],
+                            ),
+                          ),
                         ],
                       ),
+                    ],
+                  ),
+                ),
+
+                // ─── Metadata grid ─────────────────────────────────────────────
+                SliverToBoxAdapter(
+                  child: Padding(
+                    padding: const EdgeInsets.fromLTRB(24, 0, 24, 0),
+                    child: _buildMetaGrid(representative, primaryColor),
+                  ),
+                ),
+
+                // ─── Section header daftar volume ──────────────────────────────
+                SliverToBoxAdapter(
+                  child: Padding(
+                    padding: const EdgeInsets.fromLTRB(24, 24, 24, 12),
+                    child: Row(
+                      children: [
+                        Text(
+                          isSingleVolume ? 'Detail' : 'Semua Volume',
+                          style: const TextStyle(
+                            fontSize: 18,
+                            fontWeight: FontWeight.bold,
+                          ),
+                        ),
+                        const SizedBox(width: 8),
+                        if (!isSingleVolume)
+                          Container(
+                            padding: const EdgeInsets.symmetric(
+                              horizontal: 8,
+                              vertical: 2,
+                            ),
+                            decoration: BoxDecoration(
+                              color: primaryColor.withValues(alpha: 0.2),
+                              borderRadius: BorderRadius.circular(12),
+                            ),
+                            child: Text(
+                              '${_currentSeries.volumeCount}',
+                              style: TextStyle(
+                                color: primaryColor,
+                                fontSize: 12,
+                                fontWeight: FontWeight.bold,
+                              ),
+                            ),
+                          ),
+                      ],
                     ),
+                  ),
+                ),
+
+                // ─── Daftar volume ─────────────────────────────────────────────
+                SliverPadding(
+                  padding: const EdgeInsets.fromLTRB(24, 0, 24, 120),
+                  sliver: SliverList(
+                    delegate: SliverChildBuilderDelegate((context, index) {
+                      final comic = _currentSeries.volumes[index];
+                      return _VolumeCard(
+                        comic: comic,
+                        volumeIndex: index,
+                        primaryColor: primaryColor,
+                        onTap: () => _openVolume(comic),
+                        onDelete: () => _deleteVolume(comic),
+                      );
+                    }, childCount: _currentSeries.volumes.length),
                   ),
                 ),
               ],
             ),
           ),
 
-          // ─── Scrollable content ────────────────────────────────────────
-          CustomScrollView(
-            slivers: [
-              // Cover besar di tengah
-              SliverToBoxAdapter(
-                child: SizedBox(
-                  height: MediaQuery.of(context).size.height * 0.28,
-                  child: Center(
-                    child: Container(
-                      margin: const EdgeInsets.only(top: 80),
-                      width: 150,
-                      height: 220,
-                      decoration: BoxDecoration(
-                        borderRadius: BorderRadius.circular(16),
-                        boxShadow: [
-                          BoxShadow(
-                            color: Colors.black.withValues(alpha: 0.6),
-                            blurRadius: 24,
-                            offset: const Offset(0, 12),
-                          ),
-                        ],
-                      ),
-                      child: ClipRRect(
-                        borderRadius: BorderRadius.circular(16),
-                        child: _buildCoverImage(representative),
-                      ),
-                    ),
-                  ),
-                ),
-              ),
-
-              // Info series
-              SliverToBoxAdapter(
-                child: Padding(
-                  padding: const EdgeInsets.fromLTRB(24, 24, 24, 0),
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      Text(
-                        _currentSeries.seriesTitle,
-                        style: const TextStyle(
-                          fontSize: 28,
-                          fontWeight: FontWeight.bold,
-                          height: 1.1,
-                        ),
-                      ),
-                      const SizedBox(height: 8),
-                      Row(
-                        children: [
-                          _buildStatChip(
-                            icon: Icons.library_books,
-                            label:
-                                isSingleVolume
-                                    ? '1 volume'
-                                    : '${_currentSeries.volumeCount} volumes',
-                            color: primaryColor,
-                          ),
-                          const SizedBox(width: 10),
-                          _buildStatChip(
-                            icon: Icons.history,
-                            label:
-                                _currentSeries.averageProgress > 0
-                                    ? '${(_currentSeries.averageProgress * 100).toInt()}% dibaca'
-                                    : 'Belum dibaca',
-                            color: Colors.white24,
-                          ),
-                        ],
-                      ),
-                      const SizedBox(height: 20),
-                      Row(
-                        children: [
-                          Text(
-                            isSingleVolume ? 'Detail' : 'Semua Volume',
-                            style: const TextStyle(
-                              fontSize: 18,
-                              fontWeight: FontWeight.bold,
-                            ),
-                          ),
-                          const SizedBox(width: 8),
-                          if (!isSingleVolume)
-                            Container(
-                              padding: const EdgeInsets.symmetric(
-                                horizontal: 8,
-                                vertical: 2,
-                              ),
-                              decoration: BoxDecoration(
-                                color: primaryColor.withValues(alpha: 0.2),
-                                borderRadius: BorderRadius.circular(12),
-                              ),
-                              child: Text(
-                                '${_currentSeries.volumeCount}',
-                                style: TextStyle(
-                                  color: primaryColor,
-                                  fontSize: 12,
-                                  fontWeight: FontWeight.bold,
-                                ),
-                              ),
-                            ),
-                        ],
-                      ),
-                      const SizedBox(height: 12),
-                    ],
-                  ),
-                ),
-              ),
-
-              // ─── Daftar volume ───────────────────────────────────────────
-              SliverPadding(
-                padding: const EdgeInsets.fromLTRB(24, 0, 24, 120),
-                sliver: SliverList(
-                  delegate: SliverChildBuilderDelegate((context, index) {
-                    final comic = _currentSeries.volumes[index];
-                    return _VolumeCard(
-                      comic: comic,
-                      volumeIndex: index,
-                      primaryColor: primaryColor,
-                      onTap: () => _openVolume(comic),
-                      onDelete: () => _deleteVolume(comic),
-                    );
-                  }, childCount: _currentSeries.volumes.length),
-                ),
-              ),
-            ],
-          ),
-
-          // ─── App bar icons ─────────────────────────────────────────────
+          // ─── App bar icons ───────────────────────────────────────────────
           Positioned(
             top: 48,
             left: 16,
@@ -267,12 +562,15 @@ class _ComicDetailPageState extends State<ComicDetailPage> {
                   Icons.arrow_back,
                   () => Navigator.pop(context),
                 ),
-                _buildCircleButton(Icons.more_horiz, () {}),
+                _buildCircleButton(
+                  Icons.more_horiz,
+                  () => _showMoreMenu(context),
+                ),
               ],
             ),
           ),
 
-          // ─── Bottom CTA ────────────────────────────────────────────────
+          // ─── Bottom CTA ──────────────────────────────────────────────────
           Positioned(
             bottom: 0,
             left: 0,
@@ -348,6 +646,137 @@ class _ComicDetailPageState extends State<ComicDetailPage> {
     );
   }
 
+  // ─── Metadata grid ────────────────────────────────────────────────────────
+
+  Widget _buildMetaGrid(Comic comic, Color primaryColor) {
+    final items = <_MetaItem>[];
+
+    items.add(
+      _MetaItem(
+        icon: Icons.folder_zip_outlined,
+        label: 'Format',
+        value: comic.fileType.toString().split('.').last.toUpperCase(),
+      ),
+    );
+
+    items.add(
+      _MetaItem(
+        icon: Icons.library_books_outlined,
+        label: 'Volume',
+        value: '${_currentSeries.volumeCount} vol',
+      ),
+    );
+
+    if (_currentSeries.lastRead != null) {
+      final date = DateTime.fromMillisecondsSinceEpoch(
+        _currentSeries.lastRead!,
+      );
+      final diff = DateTime.now().difference(date);
+      final String timeAgo;
+      if (diff.inMinutes < 60) {
+        timeAgo = '${diff.inMinutes}m lalu';
+      } else if (diff.inHours < 24) {
+        timeAgo = '${diff.inHours}j lalu';
+      } else if (diff.inDays < 7) {
+        timeAgo = '${diff.inDays}h lalu';
+      } else {
+        timeAgo = '${date.day}/${date.month}/${date.year}';
+      }
+      items.add(
+        _MetaItem(icon: Icons.history, label: 'Terakhir', value: timeAgo),
+      );
+    }
+
+    if (comic.releaseYear != null) {
+      items.add(
+        _MetaItem(
+          icon: Icons.calendar_today_outlined,
+          label: 'Tahun',
+          value: comic.releaseYear!,
+        ),
+      );
+    }
+
+    if (comic.artist != null) {
+      items.add(
+        _MetaItem(
+          icon: Icons.brush_outlined,
+          label: 'Artist',
+          value: comic.artist!,
+        ),
+      );
+    }
+
+    if (comic.publisher != null) {
+      items.add(
+        _MetaItem(
+          icon: Icons.business_outlined,
+          label: 'Publisher',
+          value: comic.publisher!,
+        ),
+      );
+    }
+
+    if (items.isEmpty) return const SizedBox.shrink();
+
+    return GridView.builder(
+      shrinkWrap: true,
+      physics: const NeverScrollableScrollPhysics(),
+      gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
+        crossAxisCount: 3,
+        childAspectRatio: 1.6,
+        crossAxisSpacing: 10,
+        mainAxisSpacing: 10,
+      ),
+      itemCount: items.length,
+      itemBuilder: (context, index) {
+        final item = items[index];
+        return Container(
+          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+          decoration: BoxDecoration(
+            color: primaryColor.withValues(alpha: 0.07),
+            borderRadius: BorderRadius.circular(10),
+            border: Border.all(
+              color: primaryColor.withValues(alpha: 0.12),
+              width: 0.8,
+            ),
+          ),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+            children: [
+              Row(
+                children: [
+                  Icon(item.icon, size: 11, color: Colors.white38),
+                  const SizedBox(width: 4),
+                  Text(
+                    item.label.toUpperCase(),
+                    style: const TextStyle(
+                      fontSize: 9,
+                      color: Colors.white38,
+                      fontWeight: FontWeight.bold,
+                      letterSpacing: 0.5,
+                    ),
+                  ),
+                ],
+              ),
+              Text(
+                item.value,
+                style: const TextStyle(
+                  fontSize: 13,
+                  fontWeight: FontWeight.bold,
+                  color: Colors.white,
+                ),
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+              ),
+            ],
+          ),
+        );
+      },
+    );
+  }
+
   // ─── Helpers ──────────────────────────────────────────────────────────────
 
   Comic _nextVolumeToRead() {
@@ -372,25 +801,21 @@ class _ComicDetailPageState extends State<ComicDetailPage> {
     return 'Baca Lagi$volLabel';
   }
 
-  Widget _buildStatChip({
-    required IconData icon,
-    required String label,
-    required Color color,
-  }) {
+  Widget _buildChip(String label, Color color) {
     return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
+      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
       decoration: BoxDecoration(
         color: color.withValues(alpha: 0.15),
-        borderRadius: BorderRadius.circular(20),
+        borderRadius: BorderRadius.circular(4),
         border: Border.all(color: color.withValues(alpha: 0.3)),
       ),
-      child: Row(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          Icon(icon, size: 13, color: color),
-          const SizedBox(width: 5),
-          Text(label, style: TextStyle(color: color, fontSize: 12)),
-        ],
+      child: Text(
+        label,
+        style: TextStyle(
+          color: color == Colors.white24 ? Colors.white54 : color,
+          fontSize: 10,
+          fontWeight: FontWeight.bold,
+        ),
       ),
     );
   }
@@ -415,9 +840,8 @@ class _ComicDetailPageState extends State<ComicDetailPage> {
       final file = File(comic.thumbnailPath!);
       if (file.existsSync()) return Image.file(file, fit: fit);
     }
-    if (comic.coverBytes != null) {
+    if (comic.coverBytes != null)
       return Image.memory(comic.coverBytes!, fit: fit);
-    }
     if (comic.imageUrl.isNotEmpty) {
       return CachedNetworkImage(
         imageUrl: comic.imageUrl,
@@ -435,6 +859,19 @@ class _ComicDetailPageState extends State<ComicDetailPage> {
       child: const Icon(Icons.book, size: 48),
     );
   }
+}
+
+// ─── Helper data class ────────────────────────────────────────────────────────
+
+class _MetaItem {
+  final IconData icon;
+  final String label;
+  final String value;
+  const _MetaItem({
+    required this.icon,
+    required this.label,
+    required this.value,
+  });
 }
 
 // ─── Volume Card ──────────────────────────────────────────────────────────────
@@ -462,6 +899,20 @@ class _VolumeCard extends StatelessWidget {
             : 'Volume ${volumeIndex + 1}';
     final isDone = comic.progress >= 1.0;
 
+    String? fileSize;
+    if (comic.localPath != null) {
+      final file = File(comic.localPath!);
+      if (file.existsSync()) {
+        final bytes = file.lengthSync();
+        fileSize =
+            bytes >= 1024 * 1024 * 1024
+                ? '${(bytes / (1024 * 1024 * 1024)).toStringAsFixed(1)} GB'
+                : bytes >= 1024 * 1024
+                ? '${(bytes / (1024 * 1024)).toStringAsFixed(1)} MB'
+                : '${(bytes / 1024).toStringAsFixed(0)} KB';
+      }
+    }
+
     return Padding(
       padding: const EdgeInsets.only(bottom: 12),
       child: InkWell(
@@ -474,7 +925,9 @@ class _VolumeCard extends StatelessWidget {
             borderRadius: BorderRadius.circular(14),
             border: Border.all(
               color:
-                  isDone ? Colors.green.withValues(alpha: 0.3) : Colors.white10,
+                  isDone
+                      ? const Color(0xFFCFFF70).withValues(alpha: 0.3)
+                      : Colors.white10,
               width: 0.8,
             ),
           ),
@@ -494,12 +947,13 @@ class _VolumeCard extends StatelessWidget {
                 child: Padding(
                   padding: const EdgeInsets.symmetric(
                     horizontal: 14,
-                    vertical: 12,
+                    vertical: 10,
                   ),
                   child: Column(
                     crossAxisAlignment: CrossAxisAlignment.start,
                     mainAxisAlignment: MainAxisAlignment.spaceBetween,
                     children: [
+                      // Label + format badge
                       Row(
                         children: [
                           Text(
@@ -507,7 +961,10 @@ class _VolumeCard extends StatelessWidget {
                             style: TextStyle(
                               fontSize: 15,
                               fontWeight: FontWeight.bold,
-                              color: isDone ? Colors.green : Colors.white,
+                              color:
+                                  isDone
+                                      ? const Color(0xFFCFFF70)
+                                      : Colors.white,
                             ),
                           ),
                           const SizedBox(width: 8),
@@ -535,6 +992,46 @@ class _VolumeCard extends StatelessWidget {
                           ),
                         ],
                       ),
+
+                      // Halaman & ukuran file
+                      Row(
+                        children: [
+                          if (comic.totalPages != null &&
+                              comic.totalPages! > 0) ...[
+                            const Icon(
+                              Icons.menu_book_outlined,
+                              size: 11,
+                              color: Colors.white38,
+                            ),
+                            const SizedBox(width: 3),
+                            Text(
+                              '${comic.totalPages} hal',
+                              style: const TextStyle(
+                                fontSize: 11,
+                                color: Colors.white38,
+                              ),
+                            ),
+                            const SizedBox(width: 10),
+                          ],
+                          if (fileSize != null) ...[
+                            const Icon(
+                              Icons.storage_outlined,
+                              size: 11,
+                              color: Colors.white38,
+                            ),
+                            const SizedBox(width: 3),
+                            Text(
+                              fileSize,
+                              style: const TextStyle(
+                                fontSize: 11,
+                                color: Colors.white38,
+                              ),
+                            ),
+                          ],
+                        ],
+                      ),
+
+                      // Progress bar + status
                       Column(
                         crossAxisAlignment: CrossAxisAlignment.start,
                         children: [
@@ -545,7 +1042,7 @@ class _VolumeCard extends StatelessWidget {
                               minHeight: 3,
                               backgroundColor: Colors.white12,
                               valueColor: AlwaysStoppedAnimation<Color>(
-                                isDone ? Colors.green : primaryColor,
+                                isDone ? const Color(0xFFCFFF70) : primaryColor,
                               ),
                             ),
                           ),
@@ -558,7 +1055,10 @@ class _VolumeCard extends StatelessWidget {
                                 : 'Belum dibaca',
                             style: TextStyle(
                               fontSize: 11,
-                              color: isDone ? Colors.green : Colors.white38,
+                              color:
+                                  isDone
+                                      ? const Color(0xFFCFFF70)
+                                      : Colors.white38,
                             ),
                           ),
                         ],
