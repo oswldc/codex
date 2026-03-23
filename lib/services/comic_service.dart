@@ -50,6 +50,10 @@ class ComicService {
 
       if (existingIds.contains(id)) continue;
 
+      // ─── Parse series title & volume number dari nama file ────────────────
+      final seriesTitle = ComicTitleParser.parseSeriesTitle(name);
+      final volumeNumber = ComicTitleParser.parseVolumeNumber(name);
+
       String? thumbnailPath;
       if (type == ComicFileType.cbz) {
         try {
@@ -87,6 +91,8 @@ class ComicService {
           source: ComicSource.local,
           fileType: type,
           description: 'Local comic file: $fileName',
+          seriesTitle: seriesTitle,
+          volumeNumber: volumeNumber,
         ),
       );
       existingIds.add(id);
@@ -117,6 +123,37 @@ class ComicService {
       debugPrint('Load error: $e');
       return [];
     }
+  }
+
+  // ─── Group by Series ──────────────────────────────────────────────────────
+
+  /// Kelompokkan flat list Comic menjadi list ComicSeries.
+  /// Komik dengan seriesTitle yang sama → satu ComicSeries.
+  /// Setiap series diurutkan volume-nya dari kecil ke besar.
+  static List<ComicSeries> groupBySeries(List<Comic> comics) {
+    final Map<String, List<Comic>> grouped = {};
+
+    for (final comic in comics) {
+      grouped.putIfAbsent(comic.seriesTitle, () => []).add(comic);
+    }
+
+    final seriesList =
+        grouped.entries.map((entry) {
+          final volumes = [...entry.value]..sort(
+            (a, b) => (a.volumeNumber ?? 999).compareTo(b.volumeNumber ?? 999),
+          );
+          return ComicSeries(seriesTitle: entry.key, volumes: volumes);
+        }).toList();
+
+    // Urutkan series: yang paling baru dibaca di atas
+    seriesList.sort((a, b) {
+      final aRead = a.lastRead ?? 0;
+      final bRead = b.lastRead ?? 0;
+      if (aRead != bRead) return bRead.compareTo(aRead);
+      return a.seriesTitle.compareTo(b.seriesTitle);
+    });
+
+    return seriesList;
   }
 
   // ─── Sync ─────────────────────────────────────────────────────────────────
@@ -154,6 +191,16 @@ class ComicService {
     }
   }
 
+  /// Hapus semua volume dalam satu series sekaligus
+  static Future<void> deleteSeries(
+    ComicSeries series, {
+    bool deleteFiles = false,
+  }) async {
+    for (final comic in series.volumes) {
+      await deleteComic(comic, deleteFile: deleteFiles);
+    }
+  }
+
   // ─── Update progress ──────────────────────────────────────────────────────
 
   static Future<void> updateComicProgress(
@@ -187,6 +234,8 @@ class ComicService {
         lastRead: DateTime.now().millisecondsSinceEpoch,
         currentPage: currentPage ?? old.currentPage,
         totalPages: totalPages ?? old.totalPages,
+        seriesTitle: old.seriesTitle,
+        volumeNumber: old.volumeNumber,
       );
       await saveComics(comics);
     }

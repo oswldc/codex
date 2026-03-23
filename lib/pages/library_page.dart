@@ -18,7 +18,10 @@ class LibraryPage extends StatefulWidget {
 class _LibraryPageState extends State<LibraryPage> {
   int _selectedIndex = 0;
   final List<Comic> _allComics = [];
-  List<Comic> _filteredComics = [];
+
+  List<ComicSeries> _allSeries = [];
+  List<ComicSeries> _filteredSeries = [];
+
   bool _isLoading = false;
   ViewMode _viewMode = ViewMode.grid;
   final TextEditingController _searchController = TextEditingController();
@@ -42,13 +45,11 @@ class _LibraryPageState extends State<LibraryPage> {
   void _onSearchChanged() {
     final query = _searchController.text.trim().toLowerCase();
     setState(() {
-      _filteredComics =
+      _filteredSeries =
           query.isEmpty
-              ? List.from(_allComics)
-              : _allComics.where((c) {
-                return c.title.toLowerCase().contains(query) ||
-                    c.subtitle.toLowerCase().contains(query) ||
-                    c.genre.toLowerCase().contains(query);
+              ? List.from(_allSeries)
+              : _allSeries.where((s) {
+                return s.seriesTitle.toLowerCase().contains(query);
               }).toList();
     });
   }
@@ -62,7 +63,8 @@ class _LibraryPageState extends State<LibraryPage> {
         _allComics
           ..clear()
           ..addAll(comics);
-        _filteredComics = List.from(_allComics);
+        _allSeries = ComicService.groupBySeries(_allComics);
+        _filteredSeries = List.from(_allSeries);
         if (_searchController.text.trim().isNotEmpty) _onSearchChanged();
       });
     }
@@ -89,16 +91,19 @@ class _LibraryPageState extends State<LibraryPage> {
     }
   }
 
-  // ─── Delete ───────────────────────────────────────────────────────────────
+  // ─── Delete series ────────────────────────────────────────────────────────
 
-  Future<void> _deleteComic(Comic comic) async {
+  Future<void> _deleteSeries(ComicSeries series) async {
+    final isSingle = series.volumeCount == 1;
     final result = await showDialog<String>(
       context: context,
       builder:
           (context) => AlertDialog(
-            title: const Text('Hapus Komik'),
+            title: Text(isSingle ? 'Hapus Komik' : 'Hapus Series'),
             content: Text(
-              'Apa yang ingin kamu lakukan dengan "${comic.title}"?',
+              isSingle
+                  ? 'Apa yang ingin kamu lakukan dengan "${series.seriesTitle}"?'
+                  : 'Hapus semua ${series.volumeCount} volume "${series.seriesTitle}"?',
             ),
             actions: [
               TextButton(
@@ -121,7 +126,7 @@ class _LibraryPageState extends State<LibraryPage> {
     );
 
     if (result == null || result == 'cancel') return;
-    await ComicService.deleteComic(comic, deleteFile: result == 'delete');
+    await ComicService.deleteSeries(series, deleteFiles: result == 'delete');
     await _loadSavedComics();
   }
 
@@ -170,6 +175,20 @@ class _LibraryPageState extends State<LibraryPage> {
         );
       }
     }
+  }
+
+  // ─── Navigate ke detail series ────────────────────────────────────────────
+
+  Future<void> _openSeries(ComicSeries series) async {
+    _searchFocusNode.unfocus();
+    FocusScope.of(context).unfocus();
+    await Navigator.push(
+      context,
+      MaterialPageRoute(
+        builder: (context) => ComicDetailPage(comic: series.representative),
+      ),
+    );
+    await _loadSavedComics();
   }
 
   // ─── Build ────────────────────────────────────────────────────────────────
@@ -268,17 +287,29 @@ class _LibraryPageState extends State<LibraryPage> {
           Row(
             children: [
               Expanded(
-                child: Text(
-                  titles[_selectedIndex],
-                  style: const TextStyle(
-                    fontSize: 28,
-                    fontWeight: FontWeight.bold,
-                    letterSpacing: -0.5,
-                  ),
-                  overflow: TextOverflow.ellipsis,
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      titles[_selectedIndex],
+                      style: const TextStyle(
+                        fontSize: 28,
+                        fontWeight: FontWeight.bold,
+                        letterSpacing: -0.5,
+                      ),
+                      overflow: TextOverflow.ellipsis,
+                    ),
+                    if (_selectedIndex == 0 && _allSeries.isNotEmpty)
+                      Text(
+                        '${_allSeries.length} series · ${_allComics.length} volume',
+                        style: const TextStyle(
+                          fontSize: 12,
+                          color: Colors.white38,
+                        ),
+                      ),
+                  ],
                 ),
               ),
-              // ← Loading indicator (hanya tampil saat loading, tanpa refresh button)
               if (_isLoading)
                 const Padding(
                   padding: EdgeInsets.all(12),
@@ -288,7 +319,6 @@ class _LibraryPageState extends State<LibraryPage> {
                     child: CircularProgressIndicator(strokeWidth: 2),
                   ),
                 ),
-              // ← Toggle view mode (grid → gridSmall → list → grid)
               if (_selectedIndex == 0)
                 IconButton(
                   onPressed: () {
@@ -301,13 +331,9 @@ class _LibraryPageState extends State<LibraryPage> {
                     });
                   },
                   icon: Icon(switch (_viewMode) {
-                    ViewMode.grid =>
-                      Icons
-                          .grid_on_rounded, // aktif: grid besar → next: grid kecil
-                    ViewMode.gridSmall =>
-                      Icons.view_list_rounded, // aktif: grid kecil → next: list
-                    ViewMode.list =>
-                      Icons.grid_view_rounded, // aktif: list → next: grid besar
+                    ViewMode.grid => Icons.grid_on_rounded,
+                    ViewMode.gridSmall => Icons.view_list_rounded,
+                    ViewMode.list => Icons.grid_view_rounded,
                   }, color: Colors.white70),
                   tooltip: switch (_viewMode) {
                     ViewMode.grid => 'Beralih ke grid kecil',
@@ -353,7 +379,7 @@ class _LibraryPageState extends State<LibraryPage> {
   // ─── Library Tab ──────────────────────────────────────────────────────────
 
   Widget _buildLibraryTab(BuildContext context, Color accentColor) {
-    if (!_isLoading && _allComics.isEmpty) {
+    if (!_isLoading && _allSeries.isEmpty) {
       return Center(
         child: Column(
           mainAxisAlignment: MainAxisAlignment.center,
@@ -389,7 +415,7 @@ class _LibraryPageState extends State<LibraryPage> {
       );
     }
 
-    if (!_isLoading && _filteredComics.isEmpty && _allComics.isNotEmpty) {
+    if (!_isLoading && _filteredSeries.isEmpty && _allSeries.isNotEmpty) {
       return Center(
         child: Column(
           mainAxisAlignment: MainAxisAlignment.center,
@@ -431,24 +457,14 @@ class _LibraryPageState extends State<LibraryPage> {
         crossAxisSpacing: isSmall ? 10 : 16,
         mainAxisSpacing: isSmall ? 16 : 24,
       ),
-      itemCount: _filteredComics.length,
+      itemCount: _filteredSeries.length,
       itemBuilder: (context, index) {
-        final comic = _filteredComics[index];
-        return ComicCard(
-          comic: comic,
+        final series = _filteredSeries[index];
+        return SeriesCard(
+          series: series,
           isSmall: isSmall,
-          onTap: () async {
-            _searchFocusNode.unfocus();
-            FocusScope.of(context).unfocus();
-            await Navigator.push(
-              context,
-              MaterialPageRoute(
-                builder: (context) => ComicDetailPage(comic: comic),
-              ),
-            );
-            await _loadSavedComics();
-          },
-          onDelete: () => _deleteComic(comic),
+          onTap: () => _openSeries(series),
+          onDelete: () => _deleteSeries(series),
         );
       },
     );
@@ -461,41 +477,31 @@ class _LibraryPageState extends State<LibraryPage> {
 
     return ListView.builder(
       padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-      itemCount: _filteredComics.length,
+      itemCount: _filteredSeries.length,
       itemBuilder: (context, index) {
-        final comic = _filteredComics[index];
-        return ComicListTile(
-          comic: comic,
+        final series = _filteredSeries[index];
+        return SeriesListTile(
+          series: series,
           primaryColor: primaryColor,
-          onTap: () async {
-            _searchFocusNode.unfocus();
-            FocusScope.of(context).unfocus();
-            await Navigator.push(
-              context,
-              MaterialPageRoute(
-                builder: (context) => ComicDetailPage(comic: comic),
-              ),
-            );
-            await _loadSavedComics();
-          },
-          onDelete: () => _deleteComic(comic),
+          onTap: () => _openSeries(series),
+          onDelete: () => _deleteSeries(series),
         );
       },
     );
   }
 }
 
-// ─── Comic Card (Grid) ────────────────────────────────────────────────────────
+// ─── Series Card (Grid) ───────────────────────────────────────────────────────
 
-class ComicCard extends StatelessWidget {
-  final Comic comic;
+class SeriesCard extends StatelessWidget {
+  final ComicSeries series;
   final VoidCallback onTap;
   final VoidCallback onDelete;
   final bool isSmall;
 
-  const ComicCard({
+  const SeriesCard({
     super.key,
-    required this.comic,
+    required this.series,
     required this.onTap,
     required this.onDelete,
     this.isSmall = false,
@@ -504,6 +510,7 @@ class ComicCard extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final Color primaryColor = Theme.of(context).primaryColor;
+    final comic = series.representative;
 
     return GestureDetector(
       onTap: onTap,
@@ -527,7 +534,9 @@ class ComicCard extends StatelessWidget {
                 child: Stack(
                   fit: StackFit.expand,
                   children: [
-                    _buildCover(),
+                    _buildCover(comic),
+
+                    // Progress bar bawah
                     Positioned(
                       bottom: 0,
                       left: 0,
@@ -537,11 +546,13 @@ class ComicCard extends StatelessWidget {
                         color: Colors.black45,
                         child: FractionallySizedBox(
                           alignment: Alignment.centerLeft,
-                          widthFactor: comic.progress.clamp(0.0, 1.0),
+                          widthFactor: series.averageProgress.clamp(0.0, 1.0),
                           child: Container(color: primaryColor),
                         ),
                       ),
                     ),
+
+                    // Badge: jumlah volume (kalau > 1) atau progress (kalau 1)
                     Positioned(
                       top: 8,
                       right: 8,
@@ -552,15 +563,19 @@ class ComicCard extends StatelessWidget {
                         ),
                         decoration: BoxDecoration(
                           color:
-                              comic.progress >= 1.0
-                                  ? Colors.green
-                                  : primaryColor,
+                              series.volumeCount > 1
+                                  ? Colors.black87
+                                  : (series.averageProgress >= 1.0
+                                      ? Colors.green
+                                      : primaryColor),
                           borderRadius: BorderRadius.circular(4),
                         ),
                         child: Text(
-                          comic.progress >= 1.0
-                              ? 'DONE'
-                              : '${(comic.progress * 100).toInt()}%',
+                          series.volumeCount > 1
+                              ? '${series.volumeCount} vol'
+                              : (series.averageProgress >= 1.0
+                                  ? 'DONE'
+                                  : '${(series.averageProgress * 100).toInt()}%'),
                           style: const TextStyle(
                             color: Colors.white,
                             fontSize: 10,
@@ -569,6 +584,8 @@ class ComicCard extends StatelessWidget {
                         ),
                       ),
                     ),
+
+                    // Tombol delete
                     Positioned(
                       bottom: 12,
                       right: 8,
@@ -593,25 +610,26 @@ class ComicCard extends StatelessWidget {
                         ),
                       ),
                     ),
-                    if (comic.source == ComicSource.local)
-                      Positioned(
-                        top: 8,
-                        left: 8,
-                        child: Container(
-                          padding: const EdgeInsets.all(4),
-                          decoration: BoxDecoration(
-                            color: Colors.black54,
-                            borderRadius: BorderRadius.circular(4),
-                          ),
-                          child: Icon(
-                            comic.fileType == ComicFileType.pdf
-                                ? Icons.picture_as_pdf
-                                : Icons.folder_zip,
-                            size: 12,
-                            color: Colors.white,
-                          ),
+
+                    // Badge format file
+                    Positioned(
+                      top: 8,
+                      left: 8,
+                      child: Container(
+                        padding: const EdgeInsets.all(4),
+                        decoration: BoxDecoration(
+                          color: Colors.black54,
+                          borderRadius: BorderRadius.circular(4),
+                        ),
+                        child: Icon(
+                          comic.fileType == ComicFileType.pdf
+                              ? Icons.picture_as_pdf
+                              : Icons.folder_zip,
+                          size: 12,
+                          color: Colors.white,
                         ),
                       ),
+                    ),
                   ],
                 ),
               ),
@@ -619,7 +637,7 @@ class ComicCard extends StatelessWidget {
           ),
           const SizedBox(height: 8),
           Text(
-            comic.title,
+            series.seriesTitle,
             maxLines: 1,
             overflow: TextOverflow.ellipsis,
             style: TextStyle(
@@ -630,10 +648,9 @@ class ComicCard extends StatelessWidget {
           if (!isSmall) ...[
             const SizedBox(height: 2),
             Text(
-              [
-                comic.subtitle,
-                if (comic.genre.isNotEmpty) comic.genre,
-              ].join(' • '),
+              series.volumeCount > 1
+                  ? '${series.volumeCount} volumes'
+                  : comic.subtitle,
               style: const TextStyle(fontSize: 12, color: Colors.white38),
               maxLines: 1,
               overflow: TextOverflow.ellipsis,
@@ -644,12 +661,10 @@ class ComicCard extends StatelessWidget {
     );
   }
 
-  Widget _buildCover() {
+  Widget _buildCover(Comic comic) {
     if (comic.source == ComicSource.local && comic.thumbnailPath != null) {
       final file = File(comic.thumbnailPath!);
-      if (file.existsSync()) {
-        return Image.file(file, fit: BoxFit.cover);
-      }
+      if (file.existsSync()) return Image.file(file, fit: BoxFit.cover);
     }
     if (comic.imageUrl.isNotEmpty) {
       return CachedNetworkImage(
@@ -672,17 +687,17 @@ class ComicCard extends StatelessWidget {
   }
 }
 
-// ─── Comic List Tile (List View) ──────────────────────────────────────────────
+// ─── Series List Tile (List View) ─────────────────────────────────────────────
 
-class ComicListTile extends StatelessWidget {
-  final Comic comic;
+class SeriesListTile extends StatelessWidget {
+  final ComicSeries series;
   final Color primaryColor;
   final VoidCallback onTap;
   final VoidCallback onDelete;
 
-  const ComicListTile({
+  const SeriesListTile({
     super.key,
-    required this.comic,
+    required this.series,
     required this.primaryColor,
     required this.onTap,
     required this.onDelete,
@@ -690,6 +705,8 @@ class ComicListTile extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final comic = series.representative;
+
     return Padding(
       padding: const EdgeInsets.symmetric(vertical: 6),
       child: InkWell(
@@ -710,7 +727,11 @@ class ComicListTile extends StatelessWidget {
                   topLeft: Radius.circular(12),
                   bottomLeft: Radius.circular(12),
                 ),
-                child: SizedBox(width: 60, height: 88, child: _buildCover()),
+                child: SizedBox(
+                  width: 60,
+                  height: 88,
+                  child: _buildCover(comic),
+                ),
               ),
               // Info
               Expanded(
@@ -724,7 +745,7 @@ class ComicListTile extends StatelessWidget {
                     mainAxisAlignment: MainAxisAlignment.center,
                     children: [
                       Text(
-                        comic.title,
+                        series.seriesTitle,
                         maxLines: 1,
                         overflow: TextOverflow.ellipsis,
                         style: const TextStyle(
@@ -734,10 +755,9 @@ class ComicListTile extends StatelessWidget {
                       ),
                       const SizedBox(height: 3),
                       Text(
-                        [
-                          comic.subtitle,
-                          if (comic.genre.isNotEmpty) comic.genre,
-                        ].join(' • '),
+                        series.volumeCount > 1
+                            ? '${series.volumeCount} volumes'
+                            : comic.subtitle,
                         style: const TextStyle(
                           fontSize: 12,
                           color: Colors.white38,
@@ -746,15 +766,16 @@ class ComicListTile extends StatelessWidget {
                         overflow: TextOverflow.ellipsis,
                       ),
                       const SizedBox(height: 8),
-                      // Progress bar
                       ClipRRect(
                         borderRadius: BorderRadius.circular(2),
                         child: LinearProgressIndicator(
-                          value: comic.progress.clamp(0.0, 1.0),
+                          value: series.averageProgress.clamp(0.0, 1.0),
                           minHeight: 3,
                           backgroundColor: Colors.white12,
                           valueColor: AlwaysStoppedAnimation<Color>(
-                            comic.progress >= 1.0 ? Colors.green : primaryColor,
+                            series.averageProgress >= 1.0
+                                ? Colors.green
+                                : primaryColor,
                           ),
                         ),
                       ),
@@ -775,13 +796,19 @@ class ComicListTile extends StatelessWidget {
                       ),
                       decoration: BoxDecoration(
                         color:
-                            comic.progress >= 1.0 ? Colors.green : primaryColor,
+                            series.volumeCount > 1
+                                ? Colors.blueGrey
+                                : (series.averageProgress >= 1.0
+                                    ? Colors.green
+                                    : primaryColor),
                         borderRadius: BorderRadius.circular(4),
                       ),
                       child: Text(
-                        comic.progress >= 1.0
-                            ? 'DONE'
-                            : '${(comic.progress * 100).toInt()}%',
+                        series.volumeCount > 1
+                            ? '${series.volumeCount}V'
+                            : (series.averageProgress >= 1.0
+                                ? 'DONE'
+                                : '${(series.averageProgress * 100).toInt()}%'),
                         style: const TextStyle(
                           color: Colors.white,
                           fontSize: 10,
@@ -816,12 +843,10 @@ class ComicListTile extends StatelessWidget {
     );
   }
 
-  Widget _buildCover() {
+  Widget _buildCover(Comic comic) {
     if (comic.source == ComicSource.local && comic.thumbnailPath != null) {
       final file = File(comic.thumbnailPath!);
-      if (file.existsSync()) {
-        return Image.file(file, fit: BoxFit.cover);
-      }
+      if (file.existsSync()) return Image.file(file, fit: BoxFit.cover);
     }
     if (comic.imageUrl.isNotEmpty) {
       return CachedNetworkImage(
