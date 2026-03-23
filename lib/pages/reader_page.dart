@@ -1,3 +1,4 @@
+import 'dart:math' as math;
 import 'dart:ui';
 import 'dart:typed_data';
 import 'package:flutter/material.dart';
@@ -9,14 +10,19 @@ import '../services/reading_history_service.dart';
 
 class ReaderPage extends StatefulWidget {
   final Comic comic;
+  final ReadingMode initialReadingMode;
 
-  const ReaderPage({super.key, required this.comic});
+  const ReaderPage({
+    super.key,
+    required this.comic,
+    this.initialReadingMode = ReadingMode.horizontal,
+  });
 
   @override
   State<ReaderPage> createState() => _ReaderPageState();
 }
 
-enum ReadingMode { horizontal, vertical }
+enum ReadingMode { horizontal, vertical, manga }
 
 class _ReaderPageState extends State<ReaderPage> {
   bool _showUI = true;
@@ -31,17 +37,22 @@ class _ReaderPageState extends State<ReaderPage> {
   final Map<int, Uint8List> _pdfPageCache = {};
   final Set<int> _pdfPagesRendering = {};
 
+  // PDF cache eviction: keep only ±10 pages around current
+  static const int _pdfCacheRadius = 10;
+
   bool _isLoading = false;
   String _loadingMessage = 'Preparing your comic...';
-  ReadingMode _readingMode = ReadingMode.horizontal;
+  late ReadingMode _readingMode;
 
   late PageController _pageController;
 
   bool get _isPdf => widget.comic.fileType == ComicFileType.pdf;
+  bool get _isManga => _readingMode == ReadingMode.manga;
 
   @override
   void initState() {
     super.initState();
+    _readingMode = widget.initialReadingMode;
     _isLoading = true;
     _pageController = PageController();
 
@@ -56,7 +67,6 @@ class _ReaderPageState extends State<ReaderPage> {
         int total = -1;
 
         if (_isPdf && widget.comic.localPath != null) {
-          // Open the document once; keep it alive for lazy rendering
           setState(() => _loadingMessage = 'Opening PDF...');
           _pdfDocument = await PdfDocument.openFile(widget.comic.localPath!);
           total = _pdfDocument!.pagesCount;
@@ -89,7 +99,6 @@ class _ReaderPageState extends State<ReaderPage> {
             });
           }
 
-          // Pre-render current page + neighbours without blocking the UI
           if (_isPdf) _preRenderAround(targetPage);
         } else {
           if (mounted) {
@@ -108,7 +117,6 @@ class _ReaderPageState extends State<ReaderPage> {
 
   // ── PDF lazy rendering ────────────────────────────────────────────────────
 
-  /// Queue rendering for [page] and its immediate neighbours (±2).
   void _preRenderAround(int page) {
     const int radius = 2;
     final int first = (page - radius).clamp(1, _totalPages);
@@ -116,10 +124,16 @@ class _ReaderPageState extends State<ReaderPage> {
     for (int p = first; p <= last; p++) {
       _ensurePageRendered(p);
     }
+    _evictPdfCache(page);
   }
 
-  /// Render a single PDF page into [_pdfPageCache] if not already cached or
-  /// currently in-flight. Fire-and-forget: callers don't await this.
+  /// Evict PDF pages outside the cache window to prevent unbounded memory use.
+  void _evictPdfCache(int currentPage) {
+    final int keepFrom = (currentPage - _pdfCacheRadius).clamp(1, _totalPages);
+    final int keepTo = (currentPage + _pdfCacheRadius).clamp(1, _totalPages);
+    _pdfPageCache.removeWhere((page, _) => page < keepFrom || page > keepTo);
+  }
+
   Future<void> _ensurePageRendered(int pageNumber) async {
     if (_pdfDocument == null) return;
     if (_pdfPageCache.containsKey(pageNumber)) return;
@@ -129,7 +143,7 @@ class _ReaderPageState extends State<ReaderPage> {
     try {
       final PdfPage page = await _pdfDocument!.getPage(pageNumber);
       final PdfPageImage? image = await page.render(
-        width: page.width * 2, // 2× for crisp hi-DPI rendering
+        width: page.width * 2,
         height: page.height * 2,
         format: PdfPageImageFormat.png,
         backgroundColor: '#FFFFFF',
@@ -138,7 +152,7 @@ class _ReaderPageState extends State<ReaderPage> {
 
       if (image != null && mounted) {
         _pdfPageCache[pageNumber] = image.bytes;
-        setState(() {}); // Refresh the specific page item
+        setState(() {});
       }
     } catch (e) {
       debugPrint('PDF render error (page $pageNumber): $e');
@@ -150,9 +164,15 @@ class _ReaderPageState extends State<ReaderPage> {
   // ── Navigation ────────────────────────────────────────────────────────────
 
   void _onPageChanged(int index) {
+    // PageView.reverse flips the internal index when in manga mode.
+    // The logical page number is always (index + 1) regardless — Flutter
+    // handles the visual reversal internally.
     final int page = index + 1;
     setState(() => _currentPage = page);
     if (_isPdf) _preRenderAround(page);
+
+    // Auto-save progress on every page turn
+    _saveProgress(page);
   }
 
   void _jumpToPage(int page) {
@@ -162,19 +182,22 @@ class _ReaderPageState extends State<ReaderPage> {
     if (_isPdf) _preRenderAround(page);
   }
 
+  void _saveProgress(int page) {
+    final double progress = _totalPages > 0 ? (page / _totalPages) : 0.0;
+    ComicService.updateComicProgress(
+      widget.comic.id,
+      progress,
+      currentPage: page,
+      totalPages: _totalPages,
+    );
+  }
+
   // ── Lifecycle ─────────────────────────────────────────────────────────────
 
   @override
   void dispose() {
-    final double progress =
-        _totalPages > 0 ? (_currentPage / _totalPages) : 0.0;
-
-    ComicService.updateComicProgress(
-      widget.comic.id,
-      progress,
-      currentPage: _currentPage,
-      totalPages: _totalPages,
-    );
+    // Final save on exit (covers the case where user closes without turning page)
+    _saveProgress(_currentPage);
 
     ReadingHistoryService.saveEntry(
       ReadingHistoryEntry(
@@ -189,7 +212,7 @@ class _ReaderPageState extends State<ReaderPage> {
     );
 
     _pageController.dispose();
-    _pdfDocument?.close(); // Close the shared PdfDocument
+    _pdfDocument?.close();
     super.dispose();
   }
 
@@ -280,8 +303,6 @@ class _ReaderPageState extends State<ReaderPage> {
     );
   }
 
-  /// Unified PageView for all formats. PDF pages are served from
-  /// [_pdfPageCache] and rendered on demand; a spinner shows while waiting.
   Widget _buildMainContent(Color primaryColor) {
     return Container(
       color: Colors.black,
@@ -291,9 +312,11 @@ class _ReaderPageState extends State<ReaderPage> {
         boundaryMargin: const EdgeInsets.all(20),
         child: PageView.builder(
           scrollDirection:
-              _readingMode == ReadingMode.horizontal
-                  ? Axis.horizontal
-                  : Axis.vertical,
+              _readingMode == ReadingMode.vertical
+                  ? Axis.vertical
+                  : Axis.horizontal,
+          // reverse: true membalik arah scroll PageView untuk mode manga (RTL)
+          reverse: _isManga,
           controller: _pageController,
           physics: const BouncingScrollPhysics(),
           onPageChanged: _onPageChanged,
@@ -301,7 +324,7 @@ class _ReaderPageState extends State<ReaderPage> {
           itemBuilder: (context, index) {
             final int pageNumber = index + 1;
 
-            // ── PDF: serve from cache, trigger render if missing ────────────
+            // ── PDF ──────────────────────────────────────────────────────────
             if (_isPdf) {
               final Uint8List? cached = _pdfPageCache[pageNumber];
               if (cached != null) {
@@ -314,14 +337,13 @@ class _ReaderPageState extends State<ReaderPage> {
                   ),
                 );
               }
-              // Not yet in cache — kick off rendering and show a spinner
               _ensurePageRendered(pageNumber);
               return Center(
                 child: CircularProgressIndicator(color: primaryColor),
               );
             }
 
-            // ── CBZ / CBR (pre-loaded local bytes) ──────────────────────────
+            // ── CBZ / CBR ────────────────────────────────────────────────────
             if (_localPages.isNotEmpty && index < _localPages.length) {
               return Center(
                 child: Image.memory(
@@ -337,7 +359,7 @@ class _ReaderPageState extends State<ReaderPage> {
               );
             }
 
-            // ── Network pages ───────────────────────────────────────────────
+            // ── Network pages ────────────────────────────────────────────────
             if (widget.comic.pages.isNotEmpty &&
                 index < widget.comic.pages.length) {
               return CachedNetworkImage(
@@ -398,6 +420,39 @@ class _ReaderPageState extends State<ReaderPage> {
                     style: const TextStyle(color: Colors.white60, fontSize: 12),
                     textAlign: TextAlign.center,
                   ),
+                  // Badge mode manga
+                  if (_isManga) ...[
+                    const SizedBox(height: 4),
+                    Container(
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 8,
+                        vertical: 2,
+                      ),
+                      decoration: BoxDecoration(
+                        color: Colors.white.withValues(alpha: 0.15),
+                        borderRadius: BorderRadius.circular(10),
+                        border: Border.all(color: Colors.white24),
+                      ),
+                      child: const Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          Icon(
+                            Icons.arrow_back,
+                            size: 10,
+                            color: Colors.white70,
+                          ),
+                          SizedBox(width: 4),
+                          Text(
+                            'Manga',
+                            style: TextStyle(
+                              color: Colors.white70,
+                              fontSize: 10,
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ],
                 ],
               ),
             ),
@@ -426,6 +481,7 @@ class _ReaderPageState extends State<ReaderPage> {
       child: Column(
         mainAxisSize: MainAxisSize.min,
         children: [
+          // Label halaman: di manga tampilkan arah balik (kanan → kiri)
           Container(
             padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
             decoration: BoxDecoration(
@@ -452,36 +508,51 @@ class _ReaderPageState extends State<ReaderPage> {
             ),
             child:
                 ready
-                    ? SliderTheme(
-                      data: SliderTheme.of(context).copyWith(
-                        trackHeight: 2,
-                        thumbShape: const RoundSliderThumbShape(
-                          enabledThumbRadius: 6,
-                        ),
-                        overlayShape: const RoundSliderOverlayShape(
-                          overlayRadius: 14,
-                        ),
-                        activeTrackColor: primaryColor,
-                        inactiveTrackColor: Colors.white10,
-                        thumbColor: Colors.white,
-                      ),
-                      child: Slider(
-                        value: displayCurrent.toDouble(),
-                        min: 1,
-                        max: displayTotal.toDouble(),
-                        onChanged: (value) {
-                          setState(() => _currentPage = value.toInt());
-                        },
-                        onChangeEnd: (value) {
-                          _jumpToPage(value.toInt());
-                        },
-                      ),
-                    )
+                    ? _isManga
+                        // Flip slider secara visual agar konsisten dengan arah baca manga
+                        ? Transform(
+                          alignment: Alignment.center,
+                          transform: Matrix4.rotationY(math.pi),
+                          child: _buildSlider(
+                            primaryColor,
+                            displayCurrent,
+                            displayTotal,
+                          ),
+                        )
+                        : _buildSlider(
+                          primaryColor,
+                          displayCurrent,
+                          displayTotal,
+                        )
                     : const LinearProgressIndicator(
                       backgroundColor: Colors.white10,
                     ),
           ),
         ],
+      ),
+    );
+  }
+
+  Widget _buildSlider(Color primaryColor, int current, int total) {
+    return SliderTheme(
+      data: SliderTheme.of(context).copyWith(
+        trackHeight: 2,
+        thumbShape: const RoundSliderThumbShape(enabledThumbRadius: 6),
+        overlayShape: const RoundSliderOverlayShape(overlayRadius: 14),
+        activeTrackColor: primaryColor,
+        inactiveTrackColor: Colors.white10,
+        thumbColor: Colors.white,
+      ),
+      child: Slider(
+        value: current.toDouble(),
+        min: 1,
+        max: total.toDouble(),
+        onChanged: (value) {
+          setState(() => _currentPage = value.toInt());
+        },
+        onChangeEnd: (value) {
+          _jumpToPage(value.toInt());
+        },
       ),
     );
   }
@@ -550,7 +621,7 @@ class _ReaderPageState extends State<ReaderPage> {
                           },
                         ),
                       ),
-                      const SizedBox(width: 12),
+                      const SizedBox(width: 8),
                       Expanded(
                         child: _buildModeButton(
                           Icons.view_headline,
@@ -558,6 +629,18 @@ class _ReaderPageState extends State<ReaderPage> {
                           _readingMode == ReadingMode.vertical,
                           onTap: () {
                             setState(() => _readingMode = ReadingMode.vertical);
+                            Navigator.pop(context);
+                          },
+                        ),
+                      ),
+                      const SizedBox(width: 8),
+                      Expanded(
+                        child: _buildModeButton(
+                          Icons.format_textdirection_r_to_l,
+                          'Manga',
+                          _readingMode == ReadingMode.manga,
+                          onTap: () {
+                            setState(() => _readingMode = ReadingMode.manga);
                             Navigator.pop(context);
                           },
                         ),

@@ -145,10 +145,10 @@ class ComicTitleParser {
     title = title.replaceAll(RegExp(r'\[.*?\]'), '');
 
     // 4. Potong di titik kemunculan volume/chapter pattern:
-    //    - ", v01"   - " v01"   - " Vol 1"   - " Volume 1"
+    //    - ", v01"   - " v01"   - " Vol 1"   - " Volume_1" - " Volume 1"
     //    - " 001"    - "-001"   - " 1" (angka di akhir)
     title = title.replaceAll(
-      RegExp(r'[,\s-]+(?:v|vol\.?|volume)\s*\d+.*$', caseSensitive: false),
+      RegExp(r'[\s,_-]+(?:v|vol\.?|volume)[_\s]*\d+.*$', caseSensitive: false),
       '',
     );
 
@@ -162,17 +162,9 @@ class ComicTitleParser {
   }
 
   /// Parse nomor volume dari nama file komik.
-  ///
-  /// Contoh:
-  /// - "Dragon Ball v01 (2003)..."     → 1
-  /// - "Vagabond Volume 22 (Eng)"      → 22
-  /// - "Worst 1"                        → 1
-  /// - "Batman_001"                     → 1
-  /// - "One Piece" (tanpa nomor)        → null
   static int? parseVolumeNumber(String rawTitle) {
-    // Coba pola v01, vol 1, vol. 1, volume 22 (paling prioritas)
     final volumeMatch = RegExp(
-      r'(?:v|vol\.?|volume)\s*(\d+)',
+      r'(?:v|vol\.?|volume)[_\s]*(\d+)',
       caseSensitive: false,
     ).firstMatch(rawTitle);
     if (volumeMatch != null) {
