@@ -1,5 +1,4 @@
 import 'dart:io';
-import 'dart:ui';
 import 'package:flutter/material.dart';
 import 'package:cached_network_image/cached_network_image.dart';
 import '../models/comic.dart';
@@ -83,111 +82,86 @@ class _ComicDetailPageState extends State<ComicDetailPage> {
     if (_currentSeries.volumes.isEmpty && mounted) Navigator.pop(context);
   }
 
-  // ─── More menu ────────────────────────────────────────────────────────────
+  // ─── Popup menu ───────────────────────────────────────────────────────────
 
-  void _showMoreMenu(BuildContext context) {
-    showModalBottomSheet(
-      context: context,
-      backgroundColor: Colors.transparent,
-      builder:
-          (ctx) => Container(
-            decoration: BoxDecoration(
-              color: Theme.of(context).scaffoldBackgroundColor,
-              borderRadius: const BorderRadius.vertical(
-                top: Radius.circular(20),
+  Widget _buildPopupMenu(BuildContext context) {
+    return PopupMenuButton<String>(
+      icon: Container(
+        decoration: BoxDecoration(
+          color: Colors.black.withValues(alpha: 0.4),
+          shape: BoxShape.circle,
+        ),
+        padding: const EdgeInsets.all(8),
+        child: const Icon(Icons.more_horiz, color: Colors.white, size: 20),
+      ),
+      color: const Color(0xFF1E2340),
+      shape: RoundedRectangleBorder(
+        borderRadius: BorderRadius.circular(12),
+        side: BorderSide(color: Colors.white.withValues(alpha: 0.08)),
+      ),
+      offset: const Offset(0, 48),
+      onSelected: (value) async {
+        switch (value) {
+          case 'edit':
+            _showEditTitleDialog(context);
+            break;
+          case 'mark_done':
+            await _markAllAs(1.0);
+            break;
+          case 'mark_unread':
+            await _markAllAs(0.0);
+            break;
+          case 'delete':
+            await _confirmDeleteSeries(context);
+            break;
+        }
+      },
+      itemBuilder:
+          (ctx) => [
+            PopupMenuItem(
+              value: 'edit',
+              child: _popupItem(
+                Icons.edit_outlined,
+                'Edit judul series',
+                Colors.white,
               ),
-              border: Border.all(color: Colors.white10),
             ),
-            padding: const EdgeInsets.fromLTRB(24, 16, 24, 32),
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                // Handle bar
-                Container(
-                  width: 40,
-                  height: 4,
-                  margin: const EdgeInsets.only(bottom: 20),
-                  decoration: BoxDecoration(
-                    color: Colors.white24,
-                    borderRadius: BorderRadius.circular(2),
-                  ),
-                ),
-                // Judul series
-                Text(
-                  _currentSeries.seriesTitle,
-                  style: const TextStyle(
-                    fontWeight: FontWeight.bold,
-                    fontSize: 16,
-                  ),
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
-                ),
-                const SizedBox(height: 20),
-
-                _buildMenuItem(
-                  icon: Icons.edit_outlined,
-                  label: 'Edit judul series',
-                  color: Colors.white,
-                  onTap: () {
-                    Navigator.pop(ctx);
-                    _showEditTitleDialog(context);
-                  },
-                ),
-                _buildMenuItem(
-                  icon: Icons.check_circle_outline,
-                  label: 'Tandai semua selesai',
-                  color: const Color(0xFFCFFF70),
-                  onTap: () async {
-                    Navigator.pop(ctx);
-                    await _markAllAs(1.0);
-                  },
-                ),
-                _buildMenuItem(
-                  icon: Icons.radio_button_unchecked,
-                  label: 'Tandai semua belum dibaca',
-                  color: Colors.white70,
-                  onTap: () async {
-                    Navigator.pop(ctx);
-                    await _markAllAs(0.0);
-                  },
-                ),
-
-                const Divider(color: Colors.white10, height: 24),
-
-                _buildMenuItem(
-                  icon: Icons.delete_outline,
-                  label: 'Hapus series',
-                  color: Colors.redAccent,
-                  onTap: () {
-                    Navigator.pop(ctx);
-                    _confirmDeleteSeries(context);
-                  },
-                ),
-              ],
+            PopupMenuItem(
+              value: 'mark_done',
+              child: _popupItem(
+                Icons.check_circle_outline,
+                'Tandai semua selesai',
+                const Color(0xFFCFFF70),
+              ),
             ),
-          ),
+            PopupMenuItem(
+              value: 'mark_unread',
+              child: _popupItem(
+                Icons.radio_button_unchecked,
+                'Tandai belum dibaca',
+                Colors.white70,
+              ),
+            ),
+            const PopupMenuDivider(),
+            PopupMenuItem(
+              value: 'delete',
+              child: _popupItem(
+                Icons.delete_outline,
+                'Hapus series',
+                Colors.redAccent,
+              ),
+            ),
+          ],
     );
   }
 
-  Widget _buildMenuItem({
-    required IconData icon,
-    required String label,
-    required Color color,
-    required VoidCallback onTap,
-  }) {
-    return InkWell(
-      onTap: onTap,
-      borderRadius: BorderRadius.circular(12),
-      child: Padding(
-        padding: const EdgeInsets.symmetric(vertical: 12, horizontal: 4),
-        child: Row(
-          children: [
-            Icon(icon, size: 22, color: color),
-            const SizedBox(width: 16),
-            Text(label, style: TextStyle(fontSize: 15, color: color)),
-          ],
-        ),
-      ),
+  Widget _popupItem(IconData icon, String label, Color color) {
+    return Row(
+      children: [
+        Icon(icon, size: 18, color: color),
+        const SizedBox(width: 12),
+        Text(label, style: TextStyle(fontSize: 14, color: color)),
+      ],
     );
   }
 
@@ -284,9 +258,12 @@ class _ComicDetailPageState extends State<ComicDetailPage> {
             progress >= 1.0
                 ? 'Semua volume ditandai selesai'
                 : 'Semua volume ditandai belum dibaca',
+            style: const TextStyle(color: Colors.white),
           ),
           backgroundColor:
-              progress >= 1.0 ? const Color(0xFF4CAF50) : Colors.blueGrey,
+              progress >= 1.0
+                  ? Theme.of(context).primaryColor
+                  : Colors.blueGrey,
           behavior: SnackBarBehavior.floating,
         ),
       );
@@ -347,144 +324,128 @@ class _ComicDetailPageState extends State<ComicDetailPage> {
             onRefresh: _refreshSeries,
             child: CustomScrollView(
               slivers: [
-                // ─── Header: overlay gradient tipis di atas scaffold solid ───────
+                // ─── Header ───────────────────────────────────────────────
                 SliverToBoxAdapter(
-                  child: Stack(
-                    children: [
-                      // Base solid — tidak ada garis transisi ke konten di bawah
-                      Positioned.fill(
-                        child: Container(
-                          color: Theme.of(context).scaffoldBackgroundColor,
-                        ),
-                      ),
-                      // Overlay gradient hanya di area atas (app bar)
-                      Positioned(
-                        top: 0,
-                        left: 0,
-                        right: 0,
-                        height: 200,
-                        child: Container(
-                          decoration: BoxDecoration(
-                            gradient: LinearGradient(
-                              begin: Alignment.topCenter,
-                              end: Alignment.bottomCenter,
-                              colors: [
-                                primaryColor.withValues(alpha: 0.22),
-                                primaryColor.withValues(alpha: 0.0),
-                              ],
-                            ),
-                          ),
-                        ),
-                      ),
-                      Column(
-                        children: [
-                          const SizedBox(height: 100),
-
-                          // Cover di tengah
-                          Center(
-                            child: Container(
-                              width: 150,
-                              height: 150 / 0.65,
-                              decoration: BoxDecoration(
-                                borderRadius: BorderRadius.circular(12),
-                                boxShadow: [
-                                  BoxShadow(
-                                    color: Colors.black.withValues(alpha: 0.5),
-                                    blurRadius: 16,
-                                    offset: const Offset(0, 8),
-                                  ),
-                                ],
-                              ),
-                              child: ClipRRect(
-                                borderRadius: BorderRadius.circular(12),
-                                child: _buildCoverImage(representative),
-                              ),
-                            ),
-                          ),
-
-                          const SizedBox(height: 20),
-
-                          // Info di bawah cover, rata tengah
-                          Padding(
-                            padding: const EdgeInsets.symmetric(horizontal: 24),
-                            child: Column(
-                              crossAxisAlignment: CrossAxisAlignment.center,
-                              children: [
-                                Text(
-                                  _currentSeries.seriesTitle,
-                                  textAlign: TextAlign.center,
-                                  style: const TextStyle(
-                                    fontSize: 22,
-                                    fontWeight: FontWeight.bold,
-                                    height: 1.2,
-                                  ),
-                                ),
-                                if (representative.writer != null) ...[
-                                  const SizedBox(height: 5),
-                                  Text(
-                                    representative.writer!,
-                                    style: TextStyle(
-                                      fontSize: 13,
-                                      color: primaryColor.withValues(
-                                        alpha: 0.85,
-                                      ),
-                                    ),
-                                  ),
-                                ],
-                                const SizedBox(height: 10),
-                                Wrap(
-                                  spacing: 6,
-                                  runSpacing: 6,
-                                  alignment: WrapAlignment.center,
-                                  children: [
-                                    _buildChip(
-                                      representative.fileType
-                                          .toString()
-                                          .split('.')
-                                          .last
-                                          .toUpperCase(),
-                                      primaryColor,
-                                    ),
-                                    _buildChip('LOCAL', Colors.white24),
-                                    if (representative.genre.isNotEmpty &&
-                                        representative.genre != 'Local File')
-                                      _buildChip(
-                                        representative.genre,
-                                        Colors.white24,
-                                      ),
-                                  ],
-                                ),
-                                const SizedBox(height: 10),
-                                Row(
-                                  mainAxisAlignment: MainAxisAlignment.center,
-                                  children: [
-                                    Icon(
-                                      Icons.auto_stories,
-                                      size: 13,
-                                      color: primaryColor,
-                                    ),
-                                    const SizedBox(width: 5),
-                                    Text(
-                                      _currentSeries.averageProgress > 0
-                                          ? '${(_currentSeries.averageProgress * 100).toInt()}% dibaca'
-                                          : 'Belum dibaca',
-                                      style: const TextStyle(
-                                        fontSize: 12,
-                                        color: Colors.white54,
-                                      ),
-                                    ),
-                                  ],
-                                ),
-                              ],
-                            ),
-                          ),
+                  child: DecoratedBox(
+                    decoration: BoxDecoration(
+                      gradient: LinearGradient(
+                        begin: Alignment.topCenter,
+                        end: Alignment.bottomCenter,
+                        colors: [
+                          primaryColor.withValues(alpha: 0.22),
+                          primaryColor.withValues(alpha: 0.0),
                         ],
+                        stops: const [0.0, 0.4],
                       ),
-                    ],
+                    ),
+                    child: Column(
+                      children: [
+                        const SizedBox(height: 80),
+
+                        // Cover di tengah
+                        Center(
+                          child: Container(
+                            width: 150,
+                            height: 150 / 0.65,
+                            decoration: BoxDecoration(
+                              borderRadius: BorderRadius.circular(12),
+                              boxShadow: [
+                                BoxShadow(
+                                  color: Colors.black.withValues(alpha: 0.5),
+                                  blurRadius: 16,
+                                  offset: const Offset(0, 8),
+                                ),
+                              ],
+                            ),
+                            child: ClipRRect(
+                              borderRadius: BorderRadius.circular(12),
+                              child: _buildCoverImage(representative),
+                            ),
+                          ),
+                        ),
+
+                        const SizedBox(height: 12),
+
+                        // Info di bawah cover, rata tengah
+                        Padding(
+                          padding: const EdgeInsets.symmetric(horizontal: 24),
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.center,
+                            children: [
+                              Text(
+                                _currentSeries.seriesTitle,
+                                textAlign: TextAlign.center,
+                                style: const TextStyle(
+                                  fontSize: 22,
+                                  fontWeight: FontWeight.bold,
+                                  height: 1.2,
+                                ),
+                              ),
+                              if (representative.writer != null) ...[
+                                const SizedBox(height: 5),
+                                Text(
+                                  representative.writer!,
+                                  style: TextStyle(
+                                    fontSize: 13,
+                                    color: primaryColor.withValues(alpha: 0.85),
+                                  ),
+                                ),
+                              ],
+                              const SizedBox(height: 8),
+                              Wrap(
+                                spacing: 6,
+                                runSpacing: 6,
+                                alignment: WrapAlignment.center,
+                                children: [
+                                  _buildChip(
+                                    representative.fileType
+                                        .toString()
+                                        .split('.')
+                                        .last
+                                        .toUpperCase(),
+                                    primaryColor,
+                                  ),
+                                  _buildChip('LOCAL', Colors.white24),
+                                  if (representative.genre.isNotEmpty &&
+                                      representative.genre != 'Local File')
+                                    _buildChip(
+                                      representative.genre,
+                                      Colors.white24,
+                                    ),
+                                ],
+                              ),
+                              const SizedBox(height: 8),
+                              Row(
+                                mainAxisAlignment: MainAxisAlignment.center,
+                                children: [
+                                  Icon(
+                                    Icons.auto_stories,
+                                    size: 13,
+                                    color: primaryColor,
+                                  ),
+                                  const SizedBox(width: 5),
+                                  Text(
+                                    _currentSeries.averageProgress > 0
+                                        ? '${(_currentSeries.averageProgress * 100).toInt()}% dibaca'
+                                        : 'Belum dibaca',
+                                    style: const TextStyle(
+                                      fontSize: 12,
+                                      color: Colors.white54,
+                                    ),
+                                  ),
+                                ],
+                              ),
+                            ],
+                          ),
+                        ),
+
+                        const SizedBox(height: 16),
+                      ],
+                    ),
                   ),
                 ),
 
-                // ─── Metadata grid ─────────────────────────────────────────────
+                // ─── Metadata grid ─────────────────────────────────────────
                 SliverToBoxAdapter(
                   child: Padding(
                     padding: const EdgeInsets.fromLTRB(24, 0, 24, 0),
@@ -492,10 +453,10 @@ class _ComicDetailPageState extends State<ComicDetailPage> {
                   ),
                 ),
 
-                // ─── Section header daftar volume ──────────────────────────────
+                // ─── Section header daftar volume ──────────────────────────
                 SliverToBoxAdapter(
                   child: Padding(
-                    padding: const EdgeInsets.fromLTRB(24, 24, 24, 12),
+                    padding: const EdgeInsets.fromLTRB(24, 16, 24, 12),
                     child: Row(
                       children: [
                         Text(
@@ -530,7 +491,7 @@ class _ComicDetailPageState extends State<ComicDetailPage> {
                   ),
                 ),
 
-                // ─── Daftar volume ─────────────────────────────────────────────
+                // ─── Daftar volume ─────────────────────────────────────────
                 SliverPadding(
                   padding: const EdgeInsets.fromLTRB(24, 0, 24, 120),
                   sliver: SliverList(
@@ -562,10 +523,7 @@ class _ComicDetailPageState extends State<ComicDetailPage> {
                   Icons.arrow_back,
                   () => Navigator.pop(context),
                 ),
-                _buildCircleButton(
-                  Icons.more_horiz,
-                  () => _showMoreMenu(context),
-                ),
+                _buildPopupMenu(context),
               ],
             ),
           ),
@@ -821,16 +779,14 @@ class _ComicDetailPageState extends State<ComicDetailPage> {
   }
 
   Widget _buildCircleButton(IconData icon, VoidCallback onPressed) {
-    return ClipOval(
-      child: BackdropFilter(
-        filter: ImageFilter.blur(sigmaX: 10, sigmaY: 10),
-        child: Container(
-          color: Colors.black.withValues(alpha: 0.4),
-          child: IconButton(
-            icon: Icon(icon, color: Colors.white, size: 20),
-            onPressed: onPressed,
-          ),
-        ),
+    return Container(
+      decoration: BoxDecoration(
+        color: Colors.black.withValues(alpha: 0.4),
+        shape: BoxShape.circle,
+      ),
+      child: IconButton(
+        icon: Icon(icon, color: Colors.white, size: 20),
+        onPressed: onPressed,
       ),
     );
   }
@@ -933,7 +889,6 @@ class _VolumeCard extends StatelessWidget {
           ),
           child: Row(
             children: [
-              // Thumbnail
               ClipRRect(
                 borderRadius: const BorderRadius.only(
                   topLeft: Radius.circular(14),
@@ -941,8 +896,6 @@ class _VolumeCard extends StatelessWidget {
                 ),
                 child: SizedBox(width: 64, height: 96, child: _buildCover()),
               ),
-
-              // Info
               Expanded(
                 child: Padding(
                   padding: const EdgeInsets.symmetric(
@@ -953,7 +906,6 @@ class _VolumeCard extends StatelessWidget {
                     crossAxisAlignment: CrossAxisAlignment.start,
                     mainAxisAlignment: MainAxisAlignment.spaceBetween,
                     children: [
-                      // Label + format badge
                       Row(
                         children: [
                           Text(
@@ -992,8 +944,6 @@ class _VolumeCard extends StatelessWidget {
                           ),
                         ],
                       ),
-
-                      // Halaman & ukuran file
                       Row(
                         children: [
                           if (comic.totalPages != null &&
@@ -1030,8 +980,6 @@ class _VolumeCard extends StatelessWidget {
                           ],
                         ],
                       ),
-
-                      // Progress bar + status
                       Column(
                         crossAxisAlignment: CrossAxisAlignment.start,
                         children: [
@@ -1067,8 +1015,6 @@ class _VolumeCard extends StatelessWidget {
                   ),
                 ),
               ),
-
-              // Aksi
               Padding(
                 padding: const EdgeInsets.symmetric(horizontal: 10),
                 child: Column(
