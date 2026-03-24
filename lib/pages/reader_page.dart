@@ -1,12 +1,43 @@
+import 'dart:convert';
 import 'dart:math' as math;
-import 'dart:ui';
+import 'dart:ui' as ui;
 import 'dart:typed_data';
 import 'package:flutter/material.dart';
 import 'package:cached_network_image/cached_network_image.dart';
+import 'package:gal/gal.dart';
 import 'package:pdfx/pdfx.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 import '../models/comic.dart';
 import '../services/comic_service.dart';
 import '../services/reading_history_service.dart';
+
+// ── Bookmark model ────────────────────────────────────────────────────────────
+
+class Bookmark {
+  final int page;
+  final String label;
+  final int createdAt;
+
+  const Bookmark({
+    required this.page,
+    required this.label,
+    required this.createdAt,
+  });
+
+  Map<String, dynamic> toJson() => {
+    'page': page,
+    'label': label,
+    'createdAt': createdAt,
+  };
+
+  factory Bookmark.fromJson(Map<String, dynamic> json) => Bookmark(
+    page: json['page'] as int,
+    label: json['label'] as String,
+    createdAt: json['createdAt'] as int,
+  );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 
 class ReaderPage extends StatefulWidget {
   final Comic comic;
@@ -24,7 +55,7 @@ class ReaderPage extends StatefulWidget {
 
 enum ReadingMode { horizontal, vertical, manga }
 
-class _ReaderPageState extends State<ReaderPage> {
+class _ReaderPageState extends State<ReaderPage> with WidgetsBindingObserver {
   bool _showUI = true;
   int _currentPage = 1;
   int _totalPages = -1;
@@ -52,6 +83,15 @@ class _ReaderPageState extends State<ReaderPage> {
   // Zoom state — dipakai untuk mengunci PageView saat user sedang zoom
   double _currentScale = 1.0;
 
+  // Debounce save — tidak lebih dari sekali per 2 detik saat ganti halaman
+  DateTime? _lastSaved;
+
+  // Bookmark
+  List<Bookmark> _bookmarks = [];
+
+  // Mode dual-page (tampilkan 2 halaman berdampingan)
+  bool _dualPageMode = false;
+
   bool get _isPdf => widget.comic.fileType == ComicFileType.pdf;
   bool get _isManga => _readingMode == ReadingMode.manga;
   bool get _isZoomed => _currentScale > 1.05;
@@ -59,9 +99,11 @@ class _ReaderPageState extends State<ReaderPage> {
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this); // pantau lifecycle app
     _readingMode = widget.initialReadingMode;
     _isLoading = true;
     _pageController = PageController();
+    _loadBookmarks();
 
     final double initialProgress = widget.comic.progress;
     final int savedPage =
@@ -227,7 +269,293 @@ class _ReaderPageState extends State<ReaderPage> {
     _preRenderAround(page);
   }
 
-  void _saveProgress(int page) {
+  // ── Bookmark ──────────────────────────────────────────────────────────────
+
+  Future<void> _loadBookmarks() async {
+    final prefs = await SharedPreferences.getInstance();
+    final raw = prefs.getString('bookmarks_${widget.comic.id}');
+    if (raw != null && mounted) {
+      final List decoded = jsonDecode(raw);
+      setState(() {
+        _bookmarks = decoded.map((e) => Bookmark.fromJson(e)).toList();
+      });
+    }
+  }
+
+  Future<void> _saveBookmarks() async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString(
+      'bookmarks_${widget.comic.id}',
+      jsonEncode(_bookmarks.map((b) => b.toJson()).toList()),
+    );
+  }
+
+  // ── Save to gallery ───────────────────────────────────────────────────────
+
+  Future<void> _saveCurrentPageToGallery() async {
+    final bool useDual = _dualPageMode && _readingMode != ReadingMode.vertical;
+
+    try {
+      final hasAccess = await Gal.hasAccess();
+      if (!hasAccess) await Gal.requestAccess();
+
+      if (useDual) {
+        // Dual-page: gabung dua halaman jadi satu gambar lebar via Canvas
+        final int leftPage = _isManga ? _currentPage + 1 : _currentPage;
+        final int rightPage = _isManga ? _currentPage : _currentPage + 1;
+
+        final Uint8List? leftBytes = _getPageBytes(leftPage);
+        final Uint8List? rightBytes = _getPageBytes(rightPage);
+
+        if (leftBytes == null && rightBytes == null) {
+          _showSnackBar('Halaman belum selesai dimuat', isError: true);
+          return;
+        }
+
+        final Uint8List merged = await _mergePages(leftBytes, rightBytes);
+        final fileName =
+            '${widget.comic.title}_hal${leftPage}-${rightPage}_'
+            '${DateTime.now().millisecondsSinceEpoch}.jpg';
+        await Gal.putImageBytes(merged, name: fileName);
+        _showSnackBar('Halaman $leftPage–$rightPage disimpan ke galeri');
+      } else {
+        // Single-page
+        final Uint8List? bytes = _getPageBytes(_currentPage);
+        if (bytes == null) {
+          _showSnackBar('Halaman belum selesai dimuat', isError: true);
+          return;
+        }
+        final fileName =
+            '${widget.comic.title}_hal${_currentPage}_'
+            '${DateTime.now().millisecondsSinceEpoch}.jpg';
+        await Gal.putImageBytes(bytes, name: fileName);
+        _showSnackBar('Halaman $_currentPage disimpan ke galeri');
+      }
+    } catch (e) {
+      debugPrint('Save to gallery error: $e');
+      _showSnackBar('Gagal menyimpan gambar', isError: true);
+    }
+  }
+
+  /// Ambil bytes satu halaman dari cache (PDF atau CBZ).
+  Uint8List? _getPageBytes(int pageNumber) {
+    if (_isPdf) return _pdfPageCache[pageNumber];
+    if (_localPagePaths.isNotEmpty) return _cbzPageCache[pageNumber];
+    return null;
+  }
+
+  /// Gabungkan dua gambar berdampingan menjadi satu Uint8List PNG.
+  /// Gambar yang null diganti dengan canvas hitam seukuran gambar satunya.
+  Future<Uint8List> _mergePages(
+    Uint8List? leftBytes,
+    Uint8List? rightBytes,
+  ) async {
+    final ui.Image? leftImg = await _decodeImage(leftBytes);
+    final ui.Image? rightImg = await _decodeImage(rightBytes);
+
+    final int w = (leftImg?.width ?? rightImg?.width ?? 800);
+    final int h = (leftImg?.height ?? rightImg?.height ?? 1200);
+
+    final recorder = ui.PictureRecorder();
+    final canvas = ui.Canvas(recorder);
+
+    // Background hitam
+    canvas.drawRect(
+      ui.Rect.fromLTWH(0, 0, (w * 2).toDouble(), h.toDouble()),
+      ui.Paint()..color = const Color(0xFF000000),
+    );
+
+    if (leftImg != null) {
+      canvas.drawImage(leftImg, ui.Offset.zero, ui.Paint());
+    }
+    if (rightImg != null) {
+      canvas.drawImage(rightImg, ui.Offset(w.toDouble(), 0), ui.Paint());
+    }
+
+    final picture = recorder.endRecording();
+    final img = await picture.toImage(w * 2, h);
+    final byteData = await img.toByteData(format: ui.ImageByteFormat.png);
+    return byteData!.buffer.asUint8List();
+  }
+
+  Future<ui.Image?> _decodeImage(Uint8List? bytes) async {
+    if (bytes == null) return null;
+    final codec = await ui.instantiateImageCodec(bytes);
+    final frame = await codec.getNextFrame();
+    return frame.image;
+  }
+
+  void _showSnackBar(String message, {bool isError = false}) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(message),
+        backgroundColor: isError ? Colors.red.shade700 : Colors.green.shade700,
+        behavior: SnackBarBehavior.floating,
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+        margin: const EdgeInsets.fromLTRB(16, 0, 16, 80),
+        duration: const Duration(seconds: 2),
+      ),
+    );
+  }
+
+  // ── Jump-to-page dialog ───────────────────────────────────────────────────
+
+  void _showJumpToPageDialog() {
+    final controller = TextEditingController(text: '$_currentPage');
+    final primaryColor = Theme.of(context).primaryColor;
+
+    showDialog(
+      context: context,
+      builder:
+          (context) => AlertDialog(
+            backgroundColor: Theme.of(context).scaffoldBackgroundColor,
+            shape: RoundedRectangleBorder(
+              borderRadius: BorderRadius.circular(20),
+              side: BorderSide(color: Colors.white.withValues(alpha: 0.08)),
+            ),
+            title: const Text(
+              'Jump to Page',
+              style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+            ),
+            content: SizedBox(
+              width: double.maxFinite,
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  TextField(
+                    controller: controller,
+                    keyboardType: TextInputType.number,
+                    autofocus: true,
+                    style: const TextStyle(fontSize: 16),
+                    decoration: InputDecoration(
+                      hintText: '1 – $_totalPages',
+                      border: OutlineInputBorder(
+                        borderRadius: BorderRadius.circular(12),
+                      ),
+                      focusedBorder: OutlineInputBorder(
+                        borderRadius: BorderRadius.circular(12),
+                        borderSide: BorderSide(color: primaryColor),
+                      ),
+                      contentPadding: const EdgeInsets.symmetric(
+                        horizontal: 16,
+                        vertical: 12,
+                      ),
+                    ),
+                    onSubmitted: (value) {
+                      final page = int.tryParse(value);
+                      if (page != null && page >= 1 && page <= _totalPages) {
+                        _jumpToPage(page);
+                        Navigator.pop(context);
+                      }
+                    },
+                  ),
+                  if (_bookmarks.isNotEmpty) ...[
+                    const SizedBox(height: 20),
+                    const Text(
+                      'Bookmarks',
+                      style: TextStyle(
+                        fontSize: 13,
+                        fontWeight: FontWeight.w600,
+                        color: Colors.white54,
+                      ),
+                    ),
+                    const SizedBox(height: 6),
+                    ConstrainedBox(
+                      constraints: const BoxConstraints(maxHeight: 220),
+                      child: ListView.builder(
+                        shrinkWrap: true,
+                        itemCount: _bookmarks.length,
+                        itemBuilder: (context, i) {
+                          final b = _bookmarks[i];
+                          return ListTile(
+                            dense: true,
+                            contentPadding: const EdgeInsets.symmetric(
+                              horizontal: 4,
+                            ),
+                            leading: Icon(
+                              Icons.bookmark,
+                              size: 16,
+                              color: primaryColor,
+                            ),
+                            title: Text(
+                              b.label,
+                              style: const TextStyle(fontSize: 14),
+                            ),
+                            trailing: Row(
+                              mainAxisSize: MainAxisSize.min,
+                              children: [
+                                Text(
+                                  'Hal. ${b.page}',
+                                  style: const TextStyle(
+                                    color: Colors.white54,
+                                    fontSize: 12,
+                                  ),
+                                ),
+                                const SizedBox(width: 4),
+                                GestureDetector(
+                                  onTap: () async {
+                                    setState(() => _bookmarks.removeAt(i));
+                                    await _saveBookmarks();
+                                    // rebuild dialog dengan daftar terbaru
+                                    if (context.mounted) {
+                                      Navigator.pop(context);
+                                      _showJumpToPageDialog();
+                                    }
+                                  },
+                                  child: const Icon(
+                                    Icons.close,
+                                    size: 14,
+                                    color: Colors.white38,
+                                  ),
+                                ),
+                              ],
+                            ),
+                            onTap: () {
+                              _jumpToPage(b.page);
+                              Navigator.pop(context);
+                            },
+                          );
+                        },
+                      ),
+                    ),
+                  ],
+                ],
+              ),
+            ),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.pop(context),
+                child: const Text('Batal'),
+              ),
+              FilledButton(
+                style: FilledButton.styleFrom(backgroundColor: primaryColor),
+                onPressed: () {
+                  final page = int.tryParse(controller.text);
+                  if (page != null && page >= 1 && page <= _totalPages) {
+                    _jumpToPage(page);
+                    Navigator.pop(context);
+                  }
+                },
+                child: const Text('Go'),
+              ),
+            ],
+          ),
+    );
+  }
+
+  /// Simpan progress dengan debounce 2 detik agar tidak terlalu sering
+  /// write ke disk saat user scroll cepat.
+  /// [force] melewati debounce — dipakai saat app masuk background atau dispose.
+  void _saveProgress(int page, {bool force = false}) {
+    final now = DateTime.now();
+    if (!force &&
+        _lastSaved != null &&
+        now.difference(_lastSaved!).inSeconds < 2)
+      return;
+
+    _lastSaved = now;
     final double progress = _totalPages > 0 ? (page / _totalPages) : 0.0;
     ComicService.updateComicProgress(
       widget.comic.id,
@@ -239,10 +567,27 @@ class _ReaderPageState extends State<ReaderPage> {
 
   // ── Lifecycle ─────────────────────────────────────────────────────────────
 
+  /// Dipanggil saat lifecycle app berubah.
+  /// `paused`   : app masuk background (home button / switch app)
+  /// `detached` : proses akan segera mati
+  /// Keduanya terjadi SEBELUM OS kill proses — jauh lebih andal daripada dispose().
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.paused ||
+        state == AppLifecycleState.detached) {
+      _saveProgress(_currentPage, force: true);
+    }
+  }
+
   @override
   void dispose() {
-    // Final save on exit (covers the case where user closes without turning page)
-    _saveProgress(_currentPage);
+    WidgetsBinding.instance.removeObserver(this);
+    _saveProgress(_currentPage, force: true);
+
+    // Bebaskan Archive CBZ/CBR dari cache ComicService
+    if (widget.comic.localPath != null) {
+      ComicService.closeArchive(widget.comic.localPath!);
+    }
 
     ReadingHistoryService.saveEntry(
       ReadingHistoryEntry(
@@ -349,9 +694,14 @@ class _ReaderPageState extends State<ReaderPage> {
   }
 
   Widget _buildMainContent(Color primaryColor) {
+    // Dual-page: hanya aktif di mode horizontal/manga, bukan vertical
+    final bool useDual = _dualPageMode && _readingMode != ReadingMode.vertical;
+
+    // Jumlah "slot" di PageView — dual: setiap slot = 2 halaman
+    final int itemCount = useDual ? ((_totalPages + 1) ~/ 2) : _totalPages;
+
     return Container(
       color: Colors.black,
-      // InteractiveViewer TIDAK lagi di sini — dipindah ke dalam tiap item
       child: PageView.builder(
         scrollDirection:
             _readingMode == ReadingMode.vertical
@@ -359,16 +709,56 @@ class _ReaderPageState extends State<ReaderPage> {
                 : Axis.horizontal,
         reverse: _isManga,
         controller: _pageController,
-        // Kunci scroll PageView saat user sedang zoom agar pan tidak
-        // direbut sebagai "ganti halaman"
         physics:
             _isZoomed
                 ? const NeverScrollableScrollPhysics()
                 : const BouncingScrollPhysics(),
-        onPageChanged: _onPageChanged,
-        itemCount: _totalPages,
-        itemBuilder: (context, index) {
-          return _buildZoomablePage(index, primaryColor);
+        onPageChanged: (slotIndex) {
+          // Konversi slot index ke page index (0-based) lalu teruskan
+          _onPageChanged(useDual ? slotIndex * 2 : slotIndex);
+        },
+        itemCount: itemCount,
+        itemBuilder: (context, slotIndex) {
+          if (!useDual) return _buildZoomablePage(slotIndex, primaryColor);
+
+          // Dual-page: halaman kiri dan kanan dalam satu slot
+          final int leftPage = _isManga ? slotIndex * 2 + 2 : slotIndex * 2 + 1;
+          final int rightPage =
+              _isManga ? slotIndex * 2 + 1 : slotIndex * 2 + 2;
+
+          return InteractiveViewer(
+            minScale: 1.0,
+            maxScale: 5.0,
+            boundaryMargin: const EdgeInsets.all(20),
+            onInteractionUpdate: (details) {
+              if ((details.scale - _currentScale).abs() > 0.01) {
+                setState(() => _currentScale = details.scale);
+              }
+            },
+            onInteractionEnd: (_) {
+              if (_currentScale <= 1.05) {
+                setState(() => _currentScale = 1.0);
+              }
+            },
+            child: Row(
+              children: [
+                // Halaman kiri
+                Expanded(
+                  child:
+                      leftPage <= _totalPages
+                          ? _buildPageContent(leftPage - 1, primaryColor)
+                          : const SizedBox.shrink(),
+                ),
+                // Halaman kanan (tanpa divider — gap visual cukup dari image contain)
+                Expanded(
+                  child:
+                      rightPage <= _totalPages
+                          ? _buildPageContent(rightPage - 1, primaryColor)
+                          : const SizedBox.shrink(),
+                ),
+              ],
+            ),
+          );
         },
       ),
     );
@@ -384,13 +774,13 @@ class _ReaderPageState extends State<ReaderPage> {
       maxScale: 5.0,
       boundaryMargin: const EdgeInsets.all(20),
       onInteractionUpdate: (details) {
-        // Pantau skala aktif untuk mengontrol physics PageView
         if ((details.scale - _currentScale).abs() > 0.01) {
           setState(() => _currentScale = details.scale);
         }
       },
       onInteractionEnd: (_) {
         // Reset ke 1.0 saat zoom-out penuh agar swipe halaman kembali aktif
+
         if (_currentScale <= 1.05) {
           setState(() => _currentScale = 1.0);
         }
@@ -473,7 +863,9 @@ class _ReaderPageState extends State<ReaderPage> {
       child: Row(
         mainAxisAlignment: MainAxisAlignment.spaceBetween,
         children: [
+          // Kiri: back saja
           _buildGlassButton(Icons.arrow_back, () => Navigator.pop(context)),
+          // Tengah: judul + badge manga
           Expanded(
             child: Padding(
               padding: const EdgeInsets.symmetric(horizontal: 16),
@@ -494,7 +886,6 @@ class _ReaderPageState extends State<ReaderPage> {
                     style: const TextStyle(color: Colors.white60, fontSize: 12),
                     textAlign: TextAlign.center,
                   ),
-                  // Badge mode manga
                   if (_isManga) ...[
                     const SizedBox(height: 4),
                     Container(
@@ -531,6 +922,7 @@ class _ReaderPageState extends State<ReaderPage> {
               ),
             ),
           ),
+          // Kanan: settings saja
           _buildGlassButton(Icons.settings, () => _showSettings(context)),
         ],
       ),
@@ -555,20 +947,36 @@ class _ReaderPageState extends State<ReaderPage> {
       child: Column(
         mainAxisSize: MainAxisSize.min,
         children: [
-          // Label halaman: di manga tampilkan arah balik (kanan → kiri)
-          Container(
-            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-            decoration: BoxDecoration(
-              color: Colors.black.withValues(alpha: 0.6),
-              borderRadius: BorderRadius.circular(20),
-              border: Border.all(color: Colors.white10),
-            ),
-            child: Text(
-              ready ? '$displayCurrent / $displayTotal' : 'Loading...',
-              style: const TextStyle(
-                color: Colors.white,
-                fontWeight: FontWeight.bold,
-                fontSize: 13,
+          // Tap angka halaman untuk buka jump-to-page dialog
+          GestureDetector(
+            onTap: ready ? _showJumpToPageDialog : null,
+            child: Container(
+              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+              decoration: BoxDecoration(
+                color: Colors.black.withValues(alpha: 0.6),
+                borderRadius: BorderRadius.circular(20),
+                border: Border.all(color: Colors.white10),
+              ),
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Text(
+                    ready ? '$displayCurrent / $displayTotal' : 'Loading...',
+                    style: const TextStyle(
+                      color: Colors.white,
+                      fontWeight: FontWeight.bold,
+                      fontSize: 13,
+                    ),
+                  ),
+                  if (ready) ...[
+                    const SizedBox(width: 6),
+                    const Icon(
+                      Icons.unfold_more,
+                      size: 14,
+                      color: Colors.white38,
+                    ),
+                  ],
+                ],
               ),
             ),
           ),
@@ -639,7 +1047,7 @@ class _ReaderPageState extends State<ReaderPage> {
       backgroundColor: Colors.transparent,
       builder:
           (context) => BackdropFilter(
-            filter: ImageFilter.blur(sigmaX: 15, sigmaY: 15),
+            filter: ui.ImageFilter.blur(sigmaX: 15, sigmaY: 15),
             child: Container(
               padding: const EdgeInsets.all(24),
               decoration: BoxDecoration(
@@ -722,6 +1130,66 @@ class _ReaderPageState extends State<ReaderPage> {
                     ],
                   ),
                   const SizedBox(height: 24),
+                  // ── Opsi tambahan ─────────────────────────────────────────────
+                  const Text(
+                    'Opsi',
+                    style: TextStyle(
+                      color: Colors.white70,
+                      fontSize: 14,
+                      fontWeight: FontWeight.w500,
+                    ),
+                  ),
+                  const SizedBox(height: 12),
+                  StatefulBuilder(
+                    builder: (context, setSheetState) {
+                      return Column(
+                        children: [
+                          // Dual-page toggle
+                          _buildSettingsRow(
+                            icon: Icons.auto_stories,
+                            label: '2 Halaman',
+                            subtitle: 'Tampilkan dua halaman berdampingan',
+                            trailing: Switch(
+                              value: _dualPageMode,
+                              onChanged: (_) {
+                                setState(() {
+                                  _dualPageMode = !_dualPageMode;
+                                  _pageController.jumpToPage(
+                                    _dualPageMode
+                                        ? ((_currentPage - 1) ~/ 2)
+                                        : _currentPage - 1,
+                                  );
+                                });
+                                setSheetState(() {});
+                              },
+                            ),
+                          ),
+                          const SizedBox(height: 8),
+                          // Simpan ke galeri
+                          _buildSettingsRow(
+                            icon: Icons.save_alt,
+                            label: 'Simpan ke Galeri',
+                            subtitle: 'Simpan halaman ini sebagai gambar',
+                            trailing: IconButton(
+                              icon: const Icon(
+                                Icons.chevron_right,
+                                color: Colors.white38,
+                              ),
+                              onPressed: () {
+                                Navigator.pop(context);
+                                _saveCurrentPageToGallery();
+                              },
+                            ),
+                            onTap: () {
+                              Navigator.pop(context);
+                              _saveCurrentPageToGallery();
+                            },
+                          ),
+                        ],
+                      );
+                    },
+                  ),
+                  const SizedBox(height: 24),
                 ],
               ),
             ),
@@ -771,7 +1239,7 @@ class _ReaderPageState extends State<ReaderPage> {
   Widget _buildGlassButton(IconData icon, VoidCallback onPressed) {
     return ClipOval(
       child: BackdropFilter(
-        filter: ImageFilter.blur(sigmaX: 10, sigmaY: 10),
+        filter: ui.ImageFilter.blur(sigmaX: 10, sigmaY: 10),
         child: Container(
           padding: const EdgeInsets.all(4),
           decoration: BoxDecoration(
@@ -783,6 +1251,51 @@ class _ReaderPageState extends State<ReaderPage> {
             icon: Icon(icon, color: Colors.white, size: 20),
             onPressed: onPressed,
           ),
+        ),
+      ),
+    );
+  }
+
+  /// Baris opsi di settings sheet dengan ikon, label, subtitle, dan widget trailing.
+  Widget _buildSettingsRow({
+    required IconData icon,
+    required String label,
+    required String subtitle,
+    required Widget trailing,
+    VoidCallback? onTap,
+  }) {
+    return GestureDetector(
+      onTap: onTap,
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+        decoration: BoxDecoration(
+          color: Colors.white.withValues(alpha: 0.05),
+          borderRadius: BorderRadius.circular(14),
+        ),
+        child: Row(
+          children: [
+            Icon(icon, size: 20, color: Colors.white60),
+            const SizedBox(width: 12),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    label,
+                    style: const TextStyle(
+                      fontSize: 14,
+                      fontWeight: FontWeight.w500,
+                    ),
+                  ),
+                  Text(
+                    subtitle,
+                    style: const TextStyle(fontSize: 12, color: Colors.white38),
+                  ),
+                ],
+              ),
+            ),
+            trailing,
+          ],
         ),
       ),
     );
