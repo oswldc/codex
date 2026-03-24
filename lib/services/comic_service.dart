@@ -293,6 +293,7 @@ class ComicService {
     return null;
   }
 
+  /// Muat semua halaman CBZ sekaligus (dipakai di bagian lain jika perlu).
   static Future<List<Uint8List>> getPagesFromCBZ(String path) async {
     return compute(_extractCBZPages, path);
   }
@@ -331,6 +332,76 @@ class ComicService {
     }
   }
 
+  // ─── CBZ lazy loading (dipakai ReaderPage untuk hemat memori) ─────────────
+
+  /// Kembalikan daftar nama entry (path di dalam ZIP) untuk semua halaman
+  /// gambar dalam file CBZ/CBR, diurutkan secara alfanumerik.
+  /// Tidak ada bytes yang didecode
+  static Future<List<String>> getPagePathsFromCBZ(String path) async {
+    return compute(_listCBZPageNames, path);
+  }
+
+  static List<String> _listCBZPageNames(String path) {
+    try {
+      final file = File(path);
+      if (!file.existsSync()) return [];
+
+      final archive = ZipDecoder().decodeBytes(file.readAsBytesSync());
+      final imageEntries =
+          archive.files.where((f) {
+              if (!f.isFile) return false;
+              final name = f.name.toLowerCase();
+              if (name.contains('__macosx') ||
+                  name.split('/').last.startsWith('.'))
+                return false;
+              return [
+                '.jpg',
+                '.jpeg',
+                '.png',
+                '.webp',
+              ].contains(p.extension(name));
+            }).toList()
+            ..sort((a, b) => a.name.compareTo(b.name));
+
+      // Kembalikan nama entry, bukan bytes
+      return imageEntries.map((f) => f.name).toList();
+    } catch (e) {
+      debugPrint('CBZ list error: $e');
+      return [];
+    }
+  }
+
+  /// Decode satu halaman CBZ/CBR berdasarkan nama entry-nya.
+  static Future<Uint8List> getPageBytes(
+    String archivePath,
+    String entryName,
+  ) async {
+    return compute(
+      _extractCBZPageByName,
+      _CBZPageRequest(archivePath: archivePath, entryName: entryName),
+    );
+  }
+
+  static Uint8List _extractCBZPageByName(_CBZPageRequest req) {
+    try {
+      final file = File(req.archivePath);
+      if (!file.existsSync()) return Uint8List(0);
+
+      final archive = ZipDecoder().decodeBytes(file.readAsBytesSync());
+      final entry = archive.files.firstWhere(
+        (f) => f.name == req.entryName,
+        orElse: () => ArchiveFile('', 0, Uint8List(0)),
+      );
+
+      final content = entry.content;
+      if (content is Uint8List) return content;
+      if (content is List<int>) return Uint8List.fromList(content);
+    } catch (e) {
+      debugPrint('CBZ page decode error (${req.entryName}): $e');
+    }
+    return Uint8List(0);
+  }
+
   static Future<Uint8List?> _extractFirstPDFPage(String path) async {
     PdfDocument? document;
     try {
@@ -354,4 +425,12 @@ class ComicService {
       await document?.close();
     }
   }
+}
+
+// ─── Helper class untuk compute() ────────────────────────────────────────────
+
+class _CBZPageRequest {
+  final String archivePath;
+  final String entryName;
+  const _CBZPageRequest({required this.archivePath, required this.entryName});
 }

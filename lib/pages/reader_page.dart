@@ -29,8 +29,11 @@ class _ReaderPageState extends State<ReaderPage> {
   int _currentPage = 1;
   int _totalPages = -1;
 
-  // For CBZ/CBR: all pages loaded upfront (already fast via ComicService)
-  List<Uint8List> _localPages = [];
+  // For CBZ/CBR: lazy per-page cache (hanya simpan path, decode on-demand)
+  List<String> _localPagePaths = [];
+  final Map<int, Uint8List> _cbzPageCache = {};
+  final Set<int> _cbzPagesDecoding = {};
+  static const int _cbzCacheRadius = 10;
 
   // For PDF: lazy per-page cache + shared document
   PdfDocument? _pdfDocument;
@@ -46,8 +49,12 @@ class _ReaderPageState extends State<ReaderPage> {
 
   late PageController _pageController;
 
+  // Zoom state — dipakai untuk mengunci PageView saat user sedang zoom
+  double _currentScale = 1.0;
+
   bool get _isPdf => widget.comic.fileType == ComicFileType.pdf;
   bool get _isManga => _readingMode == ReadingMode.manga;
+  bool get _isZoomed => _currentScale > 1.05;
 
   @override
   void initState() {
@@ -74,10 +81,11 @@ class _ReaderPageState extends State<ReaderPage> {
                 widget.comic.fileType == ComicFileType.cbr) &&
             widget.comic.localPath != null) {
           setState(() => _loadingMessage = 'Extracting pages...');
-          _localPages = await ComicService.getPagesFromCBZ(
+          // Hanya ambil daftar path — bytes di-decode on-demand saat dibutuhkan
+          _localPagePaths = await ComicService.getPagePathsFromCBZ(
             widget.comic.localPath!,
           );
-          total = _localPages.length;
+          total = _localPagePaths.length;
         } else if (widget.comic.pages.isNotEmpty) {
           total = widget.comic.pages.length;
         }
@@ -99,7 +107,8 @@ class _ReaderPageState extends State<ReaderPage> {
             });
           }
 
-          if (_isPdf) _preRenderAround(targetPage);
+          if (_isPdf || _localPagePaths.isNotEmpty)
+            _preRenderAround(targetPage);
         } else {
           if (mounted) {
             setState(() {
@@ -122,22 +131,31 @@ class _ReaderPageState extends State<ReaderPage> {
     final int first = (page - radius).clamp(1, _totalPages);
     final int last = (page + radius).clamp(1, _totalPages);
     for (int p = first; p <= last; p++) {
-      _ensurePageRendered(p);
+      if (_isPdf) {
+        _ensurePdfPageRendered(p);
+      } else if (_localPagePaths.isNotEmpty) {
+        _ensureCbzPageDecoded(p);
+      }
     }
-    _evictPdfCache(page);
+    if (_isPdf) _evictPdfCache(page);
+    if (_localPagePaths.isNotEmpty) _evictCbzCache(page);
   }
 
-  /// Evict PDF pages outside the cache window to prevent unbounded memory use.
+  // ── PDF cache ─────────────────────────────────────────────────────────────
+
   void _evictPdfCache(int currentPage) {
     final int keepFrom = (currentPage - _pdfCacheRadius).clamp(1, _totalPages);
     final int keepTo = (currentPage + _pdfCacheRadius).clamp(1, _totalPages);
     _pdfPageCache.removeWhere((page, _) => page < keepFrom || page > keepTo);
   }
 
-  Future<void> _ensurePageRendered(int pageNumber) async {
+  Future<void> _ensurePdfPageRendered(int pageNumber) async {
     if (_pdfDocument == null) return;
     if (_pdfPageCache.containsKey(pageNumber)) return;
     if (_pdfPagesRendering.contains(pageNumber)) return;
+
+    // Evict setiap kali ada render baru agar cache tidak menumpuk
+    _evictPdfCache(pageNumber);
 
     _pdfPagesRendering.add(pageNumber);
     try {
@@ -161,17 +179,44 @@ class _ReaderPageState extends State<ReaderPage> {
     }
   }
 
+  // ── CBZ / CBR cache ───────────────────────────────────────────────────────
+
+  void _evictCbzCache(int currentPage) {
+    final int keepFrom = (currentPage - _cbzCacheRadius).clamp(1, _totalPages);
+    final int keepTo = (currentPage + _cbzCacheRadius).clamp(1, _totalPages);
+    _cbzPageCache.removeWhere((page, _) => page < keepFrom || page > keepTo);
+  }
+
+  Future<void> _ensureCbzPageDecoded(int pageNumber) async {
+    if (_localPagePaths.isEmpty) return;
+    if (_cbzPageCache.containsKey(pageNumber)) return;
+    if (_cbzPagesDecoding.contains(pageNumber)) return;
+
+    _evictCbzCache(pageNumber);
+    _cbzPagesDecoding.add(pageNumber);
+
+    try {
+      final Uint8List bytes = await ComicService.getPageBytes(
+        widget.comic.localPath!, // path file .cbz/.cbr di filesystem
+        _localPagePaths[pageNumber - 1], // nama entry di dalam ZIP
+      );
+      if (mounted) {
+        _cbzPageCache[pageNumber] = bytes;
+        setState(() {});
+      }
+    } catch (e) {
+      debugPrint('CBZ decode error (page $pageNumber): $e');
+    } finally {
+      _cbzPagesDecoding.remove(pageNumber);
+    }
+  }
+
   // ── Navigation ────────────────────────────────────────────────────────────
 
   void _onPageChanged(int index) {
-    // PageView.reverse flips the internal index when in manga mode.
-    // The logical page number is always (index + 1) regardless — Flutter
-    // handles the visual reversal internally.
     final int page = index + 1;
     setState(() => _currentPage = page);
-    if (_isPdf) _preRenderAround(page);
-
-    // Auto-save progress on every page turn
+    _preRenderAround(page);
     _saveProgress(page);
   }
 
@@ -179,7 +224,7 @@ class _ReaderPageState extends State<ReaderPage> {
     if (_pageController.hasClients) {
       _pageController.jumpToPage(page - 1);
     }
-    if (_isPdf) _preRenderAround(page);
+    _preRenderAround(page);
   }
 
   void _saveProgress(int page) {
@@ -306,82 +351,111 @@ class _ReaderPageState extends State<ReaderPage> {
   Widget _buildMainContent(Color primaryColor) {
     return Container(
       color: Colors.black,
-      child: InteractiveViewer(
-        minScale: 1.0,
-        maxScale: 5.0,
-        boundaryMargin: const EdgeInsets.all(20),
-        child: PageView.builder(
-          scrollDirection:
-              _readingMode == ReadingMode.vertical
-                  ? Axis.vertical
-                  : Axis.horizontal,
-          // reverse: true membalik arah scroll PageView untuk mode manga (RTL)
-          reverse: _isManga,
-          controller: _pageController,
-          physics: const BouncingScrollPhysics(),
-          onPageChanged: _onPageChanged,
-          itemCount: _totalPages,
-          itemBuilder: (context, index) {
-            final int pageNumber = index + 1;
-
-            // ── PDF ──────────────────────────────────────────────────────────
-            if (_isPdf) {
-              final Uint8List? cached = _pdfPageCache[pageNumber];
-              if (cached != null) {
-                return Center(
-                  child: Image.memory(
-                    cached,
-                    fit: BoxFit.contain,
-                    filterQuality: FilterQuality.medium,
-                    gaplessPlayback: true,
-                  ),
-                );
-              }
-              _ensurePageRendered(pageNumber);
-              return Center(
-                child: CircularProgressIndicator(color: primaryColor),
-              );
-            }
-
-            // ── CBZ / CBR ────────────────────────────────────────────────────
-            if (_localPages.isNotEmpty && index < _localPages.length) {
-              return Center(
-                child: Image.memory(
-                  _localPages[index],
-                  fit: BoxFit.contain,
-                  filterQuality: FilterQuality.medium,
-                  gaplessPlayback: true,
-                  errorBuilder:
-                      (context, error, stackTrace) => const Center(
-                        child: Icon(Icons.broken_image, color: Colors.white24),
-                      ),
-                ),
-              );
-            }
-
-            // ── Network pages ────────────────────────────────────────────────
-            if (widget.comic.pages.isNotEmpty &&
-                index < widget.comic.pages.length) {
-              return CachedNetworkImage(
-                imageUrl: widget.comic.pages[index],
-                fit: BoxFit.contain,
-                placeholder:
-                    (context, url) => Center(
-                      child: CircularProgressIndicator(color: primaryColor),
-                    ),
-                errorWidget:
-                    (context, url, error) =>
-                        const Icon(Icons.error, color: Colors.white24),
-              );
-            }
-
-            return Center(
-              child: CircularProgressIndicator(color: primaryColor),
-            );
-          },
-        ),
+      // InteractiveViewer TIDAK lagi di sini — dipindah ke dalam tiap item
+      child: PageView.builder(
+        scrollDirection:
+            _readingMode == ReadingMode.vertical
+                ? Axis.vertical
+                : Axis.horizontal,
+        reverse: _isManga,
+        controller: _pageController,
+        // Kunci scroll PageView saat user sedang zoom agar pan tidak
+        // direbut sebagai "ganti halaman"
+        physics:
+            _isZoomed
+                ? const NeverScrollableScrollPhysics()
+                : const BouncingScrollPhysics(),
+        onPageChanged: _onPageChanged,
+        itemCount: _totalPages,
+        itemBuilder: (context, index) {
+          return _buildZoomablePage(index, primaryColor);
+        },
       ),
     );
+  }
+
+  /// Setiap halaman punya InteractiveViewer-nya sendiri sehingga:
+  /// - Zoom state independen per halaman (reset otomatis saat ganti halaman)
+  /// - Pan saat zoom tidak direbut PageView
+  /// - Pinch gesture tidak berkonflik dengan swipe navigasi
+  Widget _buildZoomablePage(int index, Color primaryColor) {
+    return InteractiveViewer(
+      minScale: 1.0,
+      maxScale: 5.0,
+      boundaryMargin: const EdgeInsets.all(20),
+      onInteractionUpdate: (details) {
+        // Pantau skala aktif untuk mengontrol physics PageView
+        if ((details.scale - _currentScale).abs() > 0.01) {
+          setState(() => _currentScale = details.scale);
+        }
+      },
+      onInteractionEnd: (_) {
+        // Reset ke 1.0 saat zoom-out penuh agar swipe halaman kembali aktif
+        if (_currentScale <= 1.05) {
+          setState(() => _currentScale = 1.0);
+        }
+      },
+      child: _buildPageContent(index, primaryColor),
+    );
+  }
+
+  /// Konten halaman murni (tanpa zoom wrapper) — dipanggil dari _buildZoomablePage.
+  Widget _buildPageContent(int index, Color primaryColor) {
+    final int pageNumber = index + 1;
+
+    // ── PDF ────────────────────────────────────────────────────────────────
+    if (_isPdf) {
+      final Uint8List? cached = _pdfPageCache[pageNumber];
+      if (cached != null) {
+        return Center(
+          child: Image.memory(
+            cached,
+            fit: BoxFit.contain,
+            filterQuality: FilterQuality.medium,
+            gaplessPlayback: true,
+          ),
+        );
+      }
+      _ensurePdfPageRendered(pageNumber);
+      return Center(child: CircularProgressIndicator(color: primaryColor));
+    }
+
+    // ── CBZ / CBR ──────────────────────────────────────────────────────────
+    if (_localPagePaths.isNotEmpty) {
+      final Uint8List? cached = _cbzPageCache[pageNumber];
+      if (cached != null) {
+        return Center(
+          child: Image.memory(
+            cached,
+            fit: BoxFit.contain,
+            filterQuality: FilterQuality.medium,
+            gaplessPlayback: true,
+            errorBuilder:
+                (context, error, stackTrace) => const Center(
+                  child: Icon(Icons.broken_image, color: Colors.white24),
+                ),
+          ),
+        );
+      }
+      _ensureCbzPageDecoded(pageNumber);
+      return Center(child: CircularProgressIndicator(color: primaryColor));
+    }
+
+    // ── Network pages ──────────────────────────────────────────────────────
+    if (widget.comic.pages.isNotEmpty && index < widget.comic.pages.length) {
+      return CachedNetworkImage(
+        imageUrl: widget.comic.pages[index],
+        fit: BoxFit.contain,
+        placeholder:
+            (context, url) =>
+                Center(child: CircularProgressIndicator(color: primaryColor)),
+        errorWidget:
+            (context, url, error) =>
+                const Icon(Icons.error, color: Colors.white24),
+      );
+    }
+
+    return Center(child: CircularProgressIndicator(color: primaryColor));
   }
 
   // ── Bars ──────────────────────────────────────────────────────────────────
