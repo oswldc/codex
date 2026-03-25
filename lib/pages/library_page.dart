@@ -5,6 +5,7 @@ import '../models/comic.dart';
 import '../services/comic_service.dart';
 import 'comic_detail_page.dart';
 import 'recent_page.dart';
+import 'setting_page.dart';
 
 enum ViewMode { grid, gridSmall, list }
 
@@ -209,7 +210,7 @@ class _LibraryPageState extends State<LibraryPage> {
                 children: [
                   _buildLibraryTab(context, accentColor),
                   const RecentPage(),
-                  const Center(child: Text('Settings Coming Soon')),
+                  const SettingPage(),
                 ],
               ),
             ),
