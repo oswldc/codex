@@ -2,9 +2,8 @@ import 'dart:convert';
 import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:file_picker/file_picker.dart';
-import 'package:path_provider/path_provider.dart';
-import 'package:path/path.dart' as p;
 import '../services/reading_history_service.dart';
+import 'dart:typed_data';
 
 class SettingPage extends StatefulWidget {
   const SettingPage({super.key});
@@ -43,19 +42,35 @@ class _SettingPageState extends State<SettingPage> {
 
       final jsonString = const JsonEncoder.withIndent('  ').convert(exportData);
 
-      final dir = await getApplicationDocumentsDirectory();
+      // 1. Ubah string JSON menjadi format bytes
+      final bytes = Uint8List.fromList(utf8.encode(jsonString));
+
       final timestamp = DateTime.now()
           .toIso8601String()
           .replaceAll(':', '-')
           .replaceAll('.', '-')
           .substring(0, 19);
-      final fileName = 'reading_history_$timestamp.json';
-      final filePath = p.join(dir.path, fileName);
+      final defaultFileName = 'reading_history_$timestamp.json';
 
-      await File(filePath).writeAsString(jsonString);
+      // 2. Berikan parameter bytes ke dalam fungsi saveFile
+      String? outputFile = await FilePicker.platform.saveFile(
+        dialogTitle: 'Simpan Ekspor Riwayat',
+        fileName: defaultFileName,
+        type: FileType.custom,
+        allowedExtensions: ['json'],
+        bytes: bytes, // <--- Parameter wajib untuk Android & iOS
+      );
+
+      // Jika user membatalkan (menekan tombol back/cancel di dialog)
+      if (outputFile == null) {
+        return;
+      }
+
+      // CATATAN: Kita TIDAK PERLU lagi menggunakan File(outputFile).writeAsString()
+      // karena memberikan parameter 'bytes' di atas membuat file_picker otomatis menuliskan filenya.
 
       if (!mounted) return;
-      await _showExportSuccessDialog(filePath, history.length);
+      await _showExportSuccessDialog(outputFile, history.length);
     } catch (e) {
       _showSnackBar(
         'Gagal mengekspor: $e',

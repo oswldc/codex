@@ -44,6 +44,7 @@ dependencies:
   pdfx: ^2.6.0
   shared_preferences: ^2.5.3
   gal: ^2.3.2
+  share_plus: ^10.0.0
 
 dev_dependencies:
   flutter_test:

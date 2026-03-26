@@ -126,33 +126,25 @@ class Comic {
 
 class ComicTitleParser {
   /// Parse series title dari nama file komik.
-  ///
-  /// Contoh:
-  /// - "20th Century Boys, v01 (2000) [Band of the Hawks]" → "20th Century Boys"
-  /// - "[Meganebuk] Vagabond Volume 22 (Eng)"              → "Vagabond"
-  /// - "[Miku-PDF] Worst 1"                                → "Worst"
-  /// - "Dragon Ball v01 (2003) (Digital) (LuCaZ)"         → "Dragon Ball"
   static String parseSeriesTitle(String rawTitle) {
     String title = rawTitle;
 
-    // 1. Hapus prefix bracket di awal: [Meganebuk], [Miku-PDF], dll
+    // 1. Hapus prefix bracket di awal
     title = title.replaceAll(RegExp(r'^\[.*?\]\s*'), '');
 
-    // 2. Hapus semua konten dalam tanda kurung: (2000), (Eng), (Digital)
+    // 2. Hapus semua konten dalam tanda kurung
     title = title.replaceAll(RegExp(r'\(.*?\)'), '');
 
-    // 3. Hapus semua konten dalam bracket: [Band of the Hawks]
+    // 3. Hapus semua konten dalam bracket
     title = title.replaceAll(RegExp(r'\[.*?\]'), '');
 
-    // 4. Potong di titik kemunculan volume/chapter pattern:
-    //    - ", v01"   - " v01"   - " Vol 1"   - " Volume_1" - " Volume 1"
-    //    - " 001"    - "-001"   - " 1" (angka di akhir)
+    // 4. Potong di titik kemunculan volume/chapter pattern
     title = title.replaceAll(
       RegExp(r'[\s,_-]+(?:v|vol\.?|volume)[_\s]*\d+.*$', caseSensitive: false),
       '',
     );
 
-    // 5. Hapus angka standalone di akhir (misal: "Worst 1" → "Worst")
+    // 5. Hapus angka standalone di akhir
     title = title.replaceAll(RegExp(r'\s+\d+\s*$'), '');
 
     // 6. Bersihkan karakter sisa: koma, strip, spasi berlebih
