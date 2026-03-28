@@ -3,6 +3,7 @@ import 'dart:math' as math;
 import 'dart:ui' as ui;
 import 'dart:typed_data';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:cached_network_image/cached_network_image.dart';
 import 'package:gal/gal.dart';
 import 'package:pdfx/pdfx.dart';
@@ -55,7 +56,8 @@ class ReaderPage extends StatefulWidget {
 
 enum ReadingMode { horizontal, vertical, manga }
 
-class _ReaderPageState extends State<ReaderPage> with WidgetsBindingObserver {
+class _ReaderPageState extends State<ReaderPage>
+    with WidgetsBindingObserver, TickerProviderStateMixin {
   bool _showUI = true;
   int _currentPage = 1;
   int _totalPages = -1;
@@ -92,6 +94,12 @@ class _ReaderPageState extends State<ReaderPage> with WidgetsBindingObserver {
   // Mode dual-page (tampilkan 2 halaman berdampingan)
   bool _dualPageMode = false;
 
+  // Double-tap zoom
+  late TransformationController _transformationController;
+  AnimationController? _zoomAnimController;
+  Animation<Matrix4>? _zoomAnimation;
+  static const double _doubleTapZoomScale = 2.5;
+
   bool get _isPdf => widget.comic.fileType == ComicFileType.pdf;
   bool get _isManga => _readingMode == ReadingMode.manga;
   bool get _isZoomed => _currentScale > 1.05;
@@ -99,11 +107,21 @@ class _ReaderPageState extends State<ReaderPage> with WidgetsBindingObserver {
   @override
   void initState() {
     super.initState();
-    WidgetsBinding.instance.addObserver(this); // pantau lifecycle app
+    WidgetsBinding.instance.addObserver(this);
+    _transformationController = TransformationController();
+    _zoomAnimController = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 200),
+    )..addListener(() {
+      _transformationController.value = _zoomAnimation!.value;
+    });
     _readingMode = widget.initialReadingMode;
     _isLoading = true;
     _pageController = PageController();
     _loadBookmarks();
+
+    // Fullscreen: sembunyikan status bar, navigation bar, dan system UI
+    SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
 
     final double initialProgress = widget.comic.progress;
     final int savedPage =
@@ -257,7 +275,12 @@ class _ReaderPageState extends State<ReaderPage> with WidgetsBindingObserver {
 
   void _onPageChanged(int index) {
     final int page = index + 1;
-    setState(() => _currentPage = page);
+    setState(() {
+      _currentPage = page;
+      _currentScale = 1.0;
+    });
+    // Reset zoom saat ganti halaman
+    _transformationController.value = Matrix4.identity();
     _preRenderAround(page);
     _saveProgress(page);
   }
@@ -584,10 +607,16 @@ class _ReaderPageState extends State<ReaderPage> with WidgetsBindingObserver {
     WidgetsBinding.instance.removeObserver(this);
     _saveProgress(_currentPage, force: true);
 
+    // Kembalikan system UI saat keluar dari reader
+    SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
+
     // Bebaskan Archive CBZ/CBR dari cache ComicService
     if (widget.comic.localPath != null) {
       ComicService.closeArchive(widget.comic.localPath!);
     }
+
+    _transformationController.dispose();
+    _zoomAnimController?.dispose();
 
     ReadingHistoryService.saveEntry(
       ReadingHistoryEntry(
@@ -726,37 +755,46 @@ class _ReaderPageState extends State<ReaderPage> with WidgetsBindingObserver {
           final int rightPage =
               _isManga ? slotIndex * 2 + 1 : slotIndex * 2 + 2;
 
-          return InteractiveViewer(
-            minScale: 1.0,
-            maxScale: 5.0,
-            boundaryMargin: const EdgeInsets.all(20),
-            onInteractionUpdate: (details) {
-              if ((details.scale - _currentScale).abs() > 0.01) {
-                setState(() => _currentScale = details.scale);
-              }
-            },
-            onInteractionEnd: (_) {
-              if (_currentScale <= 1.05) {
-                setState(() => _currentScale = 1.0);
-              }
-            },
-            child: Row(
-              children: [
-                // Halaman kiri
-                Expanded(
-                  child:
-                      leftPage <= _totalPages
-                          ? _buildPageContent(leftPage - 1, primaryColor)
-                          : const SizedBox.shrink(),
-                ),
-                // Halaman kanan (tanpa divider — gap visual cukup dari image contain)
-                Expanded(
-                  child:
-                      rightPage <= _totalPages
-                          ? _buildPageContent(rightPage - 1, primaryColor)
-                          : const SizedBox.shrink(),
-                ),
-              ],
+          return GestureDetector(
+            onDoubleTapDown: _handleDoubleTap,
+            onDoubleTap: () {},
+            child: InteractiveViewer(
+              transformationController: _transformationController,
+              minScale: 1.0,
+              maxScale: 5.0,
+              boundaryMargin: const EdgeInsets.all(20),
+              onInteractionUpdate: (details) {
+                final scale =
+                    _transformationController.value.getMaxScaleOnAxis();
+                if ((scale - _currentScale).abs() > 0.01) {
+                  setState(() => _currentScale = scale);
+                }
+              },
+              onInteractionEnd: (_) {
+                final scale =
+                    _transformationController.value.getMaxScaleOnAxis();
+                if (scale <= 1.05) {
+                  setState(() => _currentScale = 1.0);
+                }
+              },
+              child: Row(
+                children: [
+                  // Halaman kiri
+                  Expanded(
+                    child:
+                        leftPage <= _totalPages
+                            ? _buildPageContent(leftPage - 1, primaryColor)
+                            : const SizedBox.shrink(),
+                  ),
+                  // Halaman kanan (tanpa divider — gap visual cukup dari image contain)
+                  Expanded(
+                    child:
+                        rightPage <= _totalPages
+                            ? _buildPageContent(rightPage - 1, primaryColor)
+                            : const SizedBox.shrink(),
+                  ),
+                ],
+              ),
             ),
           );
         },
@@ -764,28 +802,77 @@ class _ReaderPageState extends State<ReaderPage> with WidgetsBindingObserver {
     );
   }
 
+  // ── Double-tap zoom ───────────────────────────────────────────────────────
+
+  void _handleDoubleTap(TapDownDetails details) {
+    final bool isZoomedIn = _currentScale > 1.05;
+
+    if (isZoomedIn) {
+      _animateZoom(Matrix4.identity());
+      setState(() => _currentScale = 1.0);
+      return;
+    }
+
+    // Zoom ke titik yang di-tap
+    final Offset tap = details.localPosition;
+    final double x = -tap.dx * (_doubleTapZoomScale - 1);
+    final double y = -tap.dy * (_doubleTapZoomScale - 1);
+    final Matrix4 zoomed =
+        Matrix4.identity()
+          ..translate(x, y)
+          ..scale(_doubleTapZoomScale);
+
+    _animateZoom(zoomed);
+    setState(() => _currentScale = _doubleTapZoomScale);
+  }
+
+  void _animateZoom(Matrix4 target) {
+    _zoomAnimController!.stop();
+    _zoomAnimation = Matrix4Tween(
+      begin: _transformationController.value,
+      end: target,
+    ).animate(
+      CurvedAnimation(parent: _zoomAnimController!, curve: Curves.easeInOut),
+    )..addListener(() {
+      _transformationController.value = _zoomAnimation!.value;
+      // Update _currentScale secara real-time saat animasi berjalan
+      final scale = _transformationController.value.getMaxScaleOnAxis();
+      if ((scale - _currentScale).abs() > 0.01) {
+        setState(() => _currentScale = scale);
+      }
+    });
+    _zoomAnimController!
+      ..reset()
+      ..forward();
+  }
+
   /// Setiap halaman punya InteractiveViewer-nya sendiri sehingga:
   /// - Zoom state independen per halaman (reset otomatis saat ganti halaman)
   /// - Pan saat zoom tidak direbut PageView
   /// - Pinch gesture tidak berkonflik dengan swipe navigasi
   Widget _buildZoomablePage(int index, Color primaryColor) {
-    return InteractiveViewer(
-      minScale: 1.0,
-      maxScale: 5.0,
-      boundaryMargin: const EdgeInsets.all(20),
-      onInteractionUpdate: (details) {
-        if ((details.scale - _currentScale).abs() > 0.01) {
-          setState(() => _currentScale = details.scale);
-        }
-      },
-      onInteractionEnd: (_) {
-        // Reset ke 1.0 saat zoom-out penuh agar swipe halaman kembali aktif
-
-        if (_currentScale <= 1.05) {
-          setState(() => _currentScale = 1.0);
-        }
-      },
-      child: _buildPageContent(index, primaryColor),
+    return GestureDetector(
+      onDoubleTapDown: _handleDoubleTap,
+      onDoubleTap: () {}, // wajib ada agar onDoubleTapDown ter-trigger
+      child: InteractiveViewer(
+        transformationController: _transformationController,
+        minScale: 1.0,
+        maxScale: 5.0,
+        boundaryMargin: const EdgeInsets.all(20),
+        onInteractionUpdate: (details) {
+          final scale = _transformationController.value.getMaxScaleOnAxis();
+          if ((scale - _currentScale).abs() > 0.01) {
+            setState(() => _currentScale = scale);
+          }
+        },
+        onInteractionEnd: (_) {
+          final scale = _transformationController.value.getMaxScaleOnAxis();
+          if (scale <= 1.05) {
+            setState(() => _currentScale = 1.0);
+          }
+        },
+        child: _buildPageContent(index, primaryColor),
+      ),
     );
   }
 
