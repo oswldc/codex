@@ -112,9 +112,7 @@ class _ReaderPageState extends State<ReaderPage>
     _zoomAnimController = AnimationController(
       vsync: this,
       duration: const Duration(milliseconds: 200),
-    )..addListener(() {
-      _transformationController.value = _zoomAnimation!.value;
-    });
+    );
     _readingMode = widget.initialReadingMode;
     _isLoading = true;
     _pageController = PageController();
@@ -141,7 +139,6 @@ class _ReaderPageState extends State<ReaderPage>
                 widget.comic.fileType == ComicFileType.cbr) &&
             widget.comic.localPath != null) {
           setState(() => _loadingMessage = 'Extracting pages...');
-          // Hanya ambil daftar path — bytes di-decode on-demand saat dibutuhkan
           _localPagePaths = await ComicService.getPagePathsFromCBZ(
             widget.comic.localPath!,
           );
@@ -214,7 +211,6 @@ class _ReaderPageState extends State<ReaderPage>
     if (_pdfPageCache.containsKey(pageNumber)) return;
     if (_pdfPagesRendering.contains(pageNumber)) return;
 
-    // Evict setiap kali ada render baru agar cache tidak menumpuk
     _evictPdfCache(pageNumber);
 
     _pdfPagesRendering.add(pageNumber);
@@ -257,8 +253,8 @@ class _ReaderPageState extends State<ReaderPage>
 
     try {
       final Uint8List bytes = await ComicService.getPageBytes(
-        widget.comic.localPath!, // path file .cbz/.cbr di filesystem
-        _localPagePaths[pageNumber - 1], // nama entry di dalam ZIP
+        widget.comic.localPath!,
+        _localPagePaths[pageNumber - 1],
       );
       if (mounted) {
         _cbzPageCache[pageNumber] = bytes;
@@ -292,6 +288,42 @@ class _ReaderPageState extends State<ReaderPage>
     _preRenderAround(page);
   }
 
+  // ── Tap navigation (kiri/tengah/kanan) ───────────────────────────────────
+
+  /// Zona kiri & kanan masing-masing 25% lebar layar.
+  /// Saat zoom aktif, tap tidak navigasi — biarkan InteractiveViewer handle pan.
+  void _handleTapNavigation(Offset localPosition) {
+    if (_isZoomed) return;
+
+    final double screenWidth = MediaQuery.of(context).size.width;
+    final double zoneWidth = screenWidth * 0.25;
+
+    final bool tapLeft = localPosition.dx < zoneWidth;
+    final bool tapRight = localPosition.dx > screenWidth - zoneWidth;
+
+    if (!tapLeft && !tapRight) {
+      // Tap tengah: toggle UI
+      setState(() => _showUI = !_showUI);
+      return;
+    }
+
+    // Manga = RTL: kiri → next, kanan → prev
+    final bool goNext = _isManga ? tapLeft : tapRight;
+    final bool goPrev = _isManga ? tapRight : tapLeft;
+
+    if (goNext && _currentPage < _totalPages) {
+      _pageController.nextPage(
+        duration: const Duration(milliseconds: 250),
+        curve: Curves.easeInOut,
+      );
+    } else if (goPrev && _currentPage > 1) {
+      _pageController.previousPage(
+        duration: const Duration(milliseconds: 250),
+        curve: Curves.easeInOut,
+      );
+    }
+  }
+
   // ── Bookmark ──────────────────────────────────────────────────────────────
 
   Future<void> _loadBookmarks() async {
@@ -323,7 +355,6 @@ class _ReaderPageState extends State<ReaderPage>
       if (!hasAccess) await Gal.requestAccess();
 
       if (useDual) {
-        // Dual-page: gabung dua halaman jadi satu gambar lebar via Canvas
         final int leftPage = _isManga ? _currentPage + 1 : _currentPage;
         final int rightPage = _isManga ? _currentPage : _currentPage + 1;
 
@@ -342,7 +373,6 @@ class _ReaderPageState extends State<ReaderPage>
         await Gal.putImageBytes(merged, name: fileName);
         _showSnackBar('Halaman $leftPage–$rightPage disimpan ke galeri');
       } else {
-        // Single-page
         final Uint8List? bytes = _getPageBytes(_currentPage);
         if (bytes == null) {
           _showSnackBar('Halaman belum selesai dimuat', isError: true);
@@ -360,15 +390,12 @@ class _ReaderPageState extends State<ReaderPage>
     }
   }
 
-  /// Ambil bytes satu halaman dari cache (PDF atau CBZ).
   Uint8List? _getPageBytes(int pageNumber) {
     if (_isPdf) return _pdfPageCache[pageNumber];
     if (_localPagePaths.isNotEmpty) return _cbzPageCache[pageNumber];
     return null;
   }
 
-  /// Gabungkan dua gambar berdampingan menjadi satu Uint8List PNG.
-  /// Gambar yang null diganti dengan canvas hitam seukuran gambar satunya.
   Future<Uint8List> _mergePages(
     Uint8List? leftBytes,
     Uint8List? rightBytes,
@@ -382,7 +409,6 @@ class _ReaderPageState extends State<ReaderPage>
     final recorder = ui.PictureRecorder();
     final canvas = ui.Canvas(recorder);
 
-    // Background hitam
     canvas.drawRect(
       ui.Rect.fromLTWH(0, 0, (w * 2).toDouble(), h.toDouble()),
       ui.Paint()..color = const Color(0xFF000000),
@@ -521,7 +547,6 @@ class _ReaderPageState extends State<ReaderPage>
                                   onTap: () async {
                                     setState(() => _bookmarks.removeAt(i));
                                     await _saveBookmarks();
-                                    // rebuild dialog dengan daftar terbaru
                                     if (context.mounted) {
                                       Navigator.pop(context);
                                       _showJumpToPageDialog();
@@ -568,9 +593,6 @@ class _ReaderPageState extends State<ReaderPage>
     );
   }
 
-  /// Simpan progress dengan debounce 2 detik agar tidak terlalu sering
-  /// write ke disk saat user scroll cepat.
-  /// [force] melewati debounce — dipakai saat app masuk background atau dispose.
   void _saveProgress(int page, {bool force = false}) {
     final now = DateTime.now();
     if (!force &&
@@ -590,10 +612,6 @@ class _ReaderPageState extends State<ReaderPage>
 
   // ── Lifecycle ─────────────────────────────────────────────────────────────
 
-  /// Dipanggil saat lifecycle app berubah.
-  /// `paused`   : app masuk background (home button / switch app)
-  /// `detached` : proses akan segera mati
-  /// Keduanya terjadi SEBELUM OS kill proses — jauh lebih andal daripada dispose().
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
     if (state == AppLifecycleState.paused ||
@@ -607,10 +625,8 @@ class _ReaderPageState extends State<ReaderPage>
     WidgetsBinding.instance.removeObserver(this);
     _saveProgress(_currentPage, force: true);
 
-    // Kembalikan system UI saat keluar dari reader
     SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
 
-    // Bebaskan Archive CBZ/CBR dari cache ComicService
     if (widget.comic.localPath != null) {
       ComicService.closeArchive(widget.comic.localPath!);
     }
@@ -643,10 +659,9 @@ class _ReaderPageState extends State<ReaderPage>
       backgroundColor: Colors.black,
       body: Stack(
         children: [
-          GestureDetector(
-            onTap: () => setState(() => _showUI = !_showUI),
-            child: _buildReaderContent(),
-          ),
+          // GestureDetector di sini dihapus — toggle UI & navigasi
+          // sekarang ditangani oleh _handleTapNavigation di dalam setiap halaman.
+          _buildReaderContent(),
           AnimatedPositioned(
             duration: const Duration(milliseconds: 300),
             top: _showUI ? 0 : -120,
@@ -723,10 +738,7 @@ class _ReaderPageState extends State<ReaderPage>
   }
 
   Widget _buildMainContent(Color primaryColor) {
-    // Dual-page: hanya aktif di mode horizontal/manga, bukan vertical
     final bool useDual = _dualPageMode && _readingMode != ReadingMode.vertical;
-
-    // Jumlah "slot" di PageView — dual: setiap slot = 2 halaman
     final int itemCount = useDual ? ((_totalPages + 1) ~/ 2) : _totalPages;
 
     return Container(
@@ -743,19 +755,19 @@ class _ReaderPageState extends State<ReaderPage>
                 ? const NeverScrollableScrollPhysics()
                 : const BouncingScrollPhysics(),
         onPageChanged: (slotIndex) {
-          // Konversi slot index ke page index (0-based) lalu teruskan
           _onPageChanged(useDual ? slotIndex * 2 : slotIndex);
         },
         itemCount: itemCount,
         itemBuilder: (context, slotIndex) {
           if (!useDual) return _buildZoomablePage(slotIndex, primaryColor);
 
-          // Dual-page: halaman kiri dan kanan dalam satu slot
+          // Dual-page
           final int leftPage = _isManga ? slotIndex * 2 + 2 : slotIndex * 2 + 1;
           final int rightPage =
               _isManga ? slotIndex * 2 + 1 : slotIndex * 2 + 2;
 
           return GestureDetector(
+            onTapUp: (details) => _handleTapNavigation(details.localPosition),
             onDoubleTapDown: _handleDoubleTap,
             onDoubleTap: () {},
             child: InteractiveViewer(
@@ -779,14 +791,12 @@ class _ReaderPageState extends State<ReaderPage>
               },
               child: Row(
                 children: [
-                  // Halaman kiri
                   Expanded(
                     child:
                         leftPage <= _totalPages
                             ? _buildPageContent(leftPage - 1, primaryColor)
                             : const SizedBox.shrink(),
                   ),
-                  // Halaman kanan (tanpa divider — gap visual cukup dari image contain)
                   Expanded(
                     child:
                         rightPage <= _totalPages
@@ -808,12 +818,13 @@ class _ReaderPageState extends State<ReaderPage>
     final bool isZoomedIn = _currentScale > 1.05;
 
     if (isZoomedIn) {
+      // Zoom out kembali ke normal
       _animateZoom(Matrix4.identity());
       setState(() => _currentScale = 1.0);
       return;
     }
 
-    // Zoom ke titik yang di-tap
+    // Zoom in ke titik yang di-tap
     final Offset tap = details.localPosition;
     final double x = -tap.dx * (_doubleTapZoomScale - 1);
     final double y = -tap.dy * (_doubleTapZoomScale - 1);
@@ -835,7 +846,7 @@ class _ReaderPageState extends State<ReaderPage>
       CurvedAnimation(parent: _zoomAnimController!, curve: Curves.easeInOut),
     )..addListener(() {
       _transformationController.value = _zoomAnimation!.value;
-      // Update _currentScale secara real-time saat animasi berjalan
+      // Sync _currentScale real-time selama animasi
       final scale = _transformationController.value.getMaxScaleOnAxis();
       if ((scale - _currentScale).abs() > 0.01) {
         setState(() => _currentScale = scale);
@@ -846,12 +857,16 @@ class _ReaderPageState extends State<ReaderPage>
       ..forward();
   }
 
+  // ── Zoomable page (single-page mode) ─────────────────────────────────────
+
   /// Setiap halaman punya InteractiveViewer-nya sendiri sehingga:
   /// - Zoom state independen per halaman (reset otomatis saat ganti halaman)
   /// - Pan saat zoom tidak direbut PageView
-  /// - Pinch gesture tidak berkonflik dengan swipe navigasi
+  /// - Pinch & double-tap tidak berkonflik dengan swipe navigasi
   Widget _buildZoomablePage(int index, Color primaryColor) {
     return GestureDetector(
+      // onTapUp untuk navigasi kiri/tengah/kanan
+      onTapUp: (details) => _handleTapNavigation(details.localPosition),
       onDoubleTapDown: _handleDoubleTap,
       onDoubleTap: () {}, // wajib ada agar onDoubleTapDown ter-trigger
       child: InteractiveViewer(
@@ -859,6 +874,7 @@ class _ReaderPageState extends State<ReaderPage>
         minScale: 1.0,
         maxScale: 5.0,
         boundaryMargin: const EdgeInsets.all(20),
+        // Pinch zoom sudah aktif secara native di InteractiveViewer
         onInteractionUpdate: (details) {
           final scale = _transformationController.value.getMaxScaleOnAxis();
           if ((scale - _currentScale).abs() > 0.01) {
@@ -876,7 +892,7 @@ class _ReaderPageState extends State<ReaderPage>
     );
   }
 
-  /// Konten halaman murni (tanpa zoom wrapper) — dipanggil dari _buildZoomablePage.
+  /// Konten halaman murni (tanpa zoom/gesture wrapper).
   Widget _buildPageContent(int index, Color primaryColor) {
     final int pageNumber = index + 1;
 
@@ -950,9 +966,7 @@ class _ReaderPageState extends State<ReaderPage>
       child: Row(
         mainAxisAlignment: MainAxisAlignment.spaceBetween,
         children: [
-          // Kiri: back saja
           _buildGlassButton(Icons.arrow_back, () => Navigator.pop(context)),
-          // Tengah: judul + badge manga
           Expanded(
             child: Padding(
               padding: const EdgeInsets.symmetric(horizontal: 16),
@@ -1009,7 +1023,6 @@ class _ReaderPageState extends State<ReaderPage>
               ),
             ),
           ),
-          // Kanan: settings saja
           _buildGlassButton(Icons.settings, () => _showSettings(context)),
         ],
       ),
@@ -1034,7 +1047,6 @@ class _ReaderPageState extends State<ReaderPage>
       child: Column(
         mainAxisSize: MainAxisSize.min,
         children: [
-          // Tap angka halaman untuk buka jump-to-page dialog
           GestureDetector(
             onTap: ready ? _showJumpToPageDialog : null,
             child: Container(
@@ -1078,7 +1090,6 @@ class _ReaderPageState extends State<ReaderPage>
             child:
                 ready
                     ? _isManga
-                        // Flip slider secara visual agar konsisten dengan arah baca manga
                         ? Transform(
                           alignment: Alignment.center,
                           transform: Matrix4.rotationY(math.pi),
@@ -1217,7 +1228,6 @@ class _ReaderPageState extends State<ReaderPage>
                     ],
                   ),
                   const SizedBox(height: 24),
-                  // ── Opsi tambahan ─────────────────────────────────────────────
                   const Text(
                     'Opsi',
                     style: TextStyle(
@@ -1231,7 +1241,6 @@ class _ReaderPageState extends State<ReaderPage>
                     builder: (context, setSheetState) {
                       return Column(
                         children: [
-                          // Dual-page toggle
                           _buildSettingsRow(
                             icon: Icons.auto_stories,
                             label: '2 Halaman',
@@ -1252,7 +1261,6 @@ class _ReaderPageState extends State<ReaderPage>
                             ),
                           ),
                           const SizedBox(height: 8),
-                          // Simpan ke galeri
                           _buildSettingsRow(
                             icon: Icons.save_alt,
                             label: 'Simpan ke Galeri',
@@ -1343,7 +1351,6 @@ class _ReaderPageState extends State<ReaderPage>
     );
   }
 
-  /// Baris opsi di settings sheet dengan ikon, label, subtitle, dan widget trailing.
   Widget _buildSettingsRow({
     required IconData icon,
     required String label,

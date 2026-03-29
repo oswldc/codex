@@ -1,9 +1,71 @@
 import 'dart:io';
+import 'dart:typed_data';
+import 'package:exif/exif.dart';
 import 'package:flutter/material.dart';
 import '../models/comic.dart';
 import '../services/comic_service.dart';
 import '../services/reading_history_service.dart';
 import 'reader_page.dart';
+
+// ─── EXIF-aware thumbnail ──────────────────────────────────────────────────
+
+class _ExifImage extends StatefulWidget {
+  final String path;
+  final BoxFit fit;
+
+  const _ExifImage({required this.path, this.fit = BoxFit.cover});
+
+  @override
+  State<_ExifImage> createState() => _ExifImageState();
+}
+
+class _ExifImageState extends State<_ExifImage> {
+  int _quarterTurns = 0;
+
+  @override
+  void initState() {
+    super.initState();
+    _readExif();
+  }
+
+  Future<void> _readExif() async {
+    try {
+      final bytes = await File(widget.path).readAsBytes();
+      final tags = await readExifFromBytes(bytes);
+      debugPrint('=== EXIF tags for ${widget.path} ===');
+      tags.forEach((key, value) => debugPrint('$key: ${value.printable}'));
+      final orientation = tags['Image Orientation'];
+      if (orientation == null) return;
+
+      // Nilai EXIF orientation → quarterTurns untuk RotatedBox
+      // 1 = normal, 3 = 180°, 6 = 90° CW, 8 = 90° CCW
+      final raw = orientation.printable;
+      int turns = 0;
+      if (raw.contains('Rotated 180'))
+        turns = 2;
+      else if (raw.contains('Rotated 90 CW'))
+        turns = 1;
+      else if (raw.contains('Rotated 90 CCW'))
+        turns = 3;
+
+      if (turns != 0 && mounted) {
+        setState(() => _quarterTurns = turns);
+      }
+    } catch (_) {
+      // Gagal baca EXIF → tampil tanpa rotasi, tidak masalah
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return RotatedBox(
+      quarterTurns: _quarterTurns,
+      child: Image.file(File(widget.path), fit: widget.fit),
+    );
+  }
+}
+
+// ─── RecentPage ───────────────────────────────────────────────────────────
 
 class RecentPage extends StatefulWidget {
   const RecentPage({super.key});
@@ -42,13 +104,8 @@ class _RecentPageState extends State<RecentPage> with WidgetsBindingObserver {
   Future<void> _loadAll() async {
     if (_history.isEmpty) setState(() => _isLoading = true);
 
-    // Ambil semua komik dari library
     final allComics = await ComicService.loadComics();
-
-    // ✅ Migrasi data lama (hanya jalan sekali)
     await ReadingHistoryService.migrateFromComics(allComics);
-
-    // Load riwayat dari service terpisah
     final history = await ReadingHistoryService.loadHistory();
 
     if (mounted) {
@@ -237,8 +294,9 @@ class _RecentPageState extends State<RecentPage> with WidgetsBindingObserver {
                                           Colors.transparent,
                                           BlendMode.multiply,
                                         ),
-                                child: Image.file(
-                                  File(entry.thumbnailPath!),
+                                // ✅ Pakai _ExifImage agar rotasi EXIF diterapkan
+                                child: _ExifImage(
+                                  path: entry.thumbnailPath!,
                                   fit: BoxFit.cover,
                                 ),
                               )

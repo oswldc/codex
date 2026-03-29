@@ -362,7 +362,6 @@ class ComicService {
   /// Archive dibuka di sini dan di-cache — getPageBytes akan memakai ulang
   /// archive yang sama tanpa baca ulang dari disk.
   static Future<List<String>> getPagePathsFromCBZ(String path) async {
-    // Buka di isolate utama karena hasilnya di-cache di static map
     final archive = _getOrOpenArchive(path);
     if (archive == null) return [];
     return _listCBZPageNamesFromArchive(archive);
@@ -388,13 +387,10 @@ class ComicService {
   }
 
   /// Decode satu halaman dari archive yang sudah di-cache.
-  /// Tidak membuka ulang ZIP dari disk — hanya lookup entry di Archive
-  /// yang sudah ada di memory.
   static Future<Uint8List> getPageBytes(
     String archivePath,
     String entryName,
   ) async {
-    // Jalankan di isolate utama — archive sudah di-cache, tidak ada I/O berat
     final archive = _getOrOpenArchive(archivePath);
     if (archive == null) return Uint8List(0);
 
