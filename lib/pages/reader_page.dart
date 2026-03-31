@@ -62,7 +62,7 @@ class _ReaderPageState extends State<ReaderPage>
   int _currentPage = 1;
   int _totalPages = -1;
 
-  // For CBZ/CBR: lazy per-page cache (hanya simpan path, decode on-demand)
+  // For CBZ/CBR: lazy per-page cache
   List<String> _localPagePaths = [];
   final Map<int, Uint8List> _cbzPageCache = {};
   final Set<int> _cbzPagesDecoding = {};
@@ -72,8 +72,6 @@ class _ReaderPageState extends State<ReaderPage>
   PdfDocument? _pdfDocument;
   final Map<int, Uint8List> _pdfPageCache = {};
   final Set<int> _pdfPagesRendering = {};
-
-  // PDF cache eviction: keep only ±10 pages around current
   static const int _pdfCacheRadius = 10;
 
   bool _isLoading = false;
@@ -82,33 +80,76 @@ class _ReaderPageState extends State<ReaderPage>
 
   late PageController _pageController;
 
-  // Zoom state — dipakai untuk mengunci PageView saat user sedang zoom
-  double _currentScale = 1.0;
+  // FIX 1: Per-page TransformationController — tidak ada lagi zoom leak antar halaman
+  final Map<int, TransformationController> _transformControllers = {};
+  // Track scale per halaman agar _isZoomed bisa cek halaman yang aktif
+  final Map<int, double> _pageScales = {};
 
-  // Debounce save — tidak lebih dari sekali per 2 detik saat ganti halaman
+  // FIX 3: Local slider value — dipakai hanya untuk display saat drag
+  double? _sliderDragValue;
+
+  // FIX 4: Tap zone flash overlay state
+  // null = tidak ada flash, true = kanan/next, false = kiri/prev
+  bool? _tapFlashRight;
+
+  // AnimationController untuk zoom double-tap, dipakai bersama per halaman
+  AnimationController? _zoomAnimController;
+  Animation<Matrix4>? _zoomAnimation;
+  // Track controller mana yang sedang di-animasi
+  TransformationController? _activeAnimTarget;
+
+  static const double _doubleTapZoomScale = 1.5;
+
+  // Debounce save
   DateTime? _lastSaved;
 
   // Bookmark
   List<Bookmark> _bookmarks = [];
 
-  // Mode dual-page (tampilkan 2 halaman berdampingan)
+  // Mode dual-page
   bool _dualPageMode = false;
-
-  // Double-tap zoom
-  late TransformationController _transformationController;
-  AnimationController? _zoomAnimController;
-  Animation<Matrix4>? _zoomAnimation;
-  static const double _doubleTapZoomScale = 2.5;
 
   bool get _isPdf => widget.comic.fileType == ComicFileType.pdf;
   bool get _isManga => _readingMode == ReadingMode.manga;
-  bool get _isZoomed => _currentScale > 1.05;
+
+  // FIX 1: Cek zoom dari halaman yang sedang aktif
+  bool get _isZoomed => (_pageScales[_currentPage] ?? 1.0) > 1.05;
+
+  // ── Controller per halaman ────────────────────────────────────────────────
+
+  TransformationController _controllerForPage(int pageNumber) {
+    return _transformControllers.putIfAbsent(
+      pageNumber,
+      () => TransformationController(),
+    );
+  }
+
+  void _resetPageZoom(int pageNumber) {
+    final ctrl = _transformControllers[pageNumber];
+    if (ctrl != null) {
+      ctrl.value = Matrix4.identity();
+    }
+    _pageScales[pageNumber] = 1.0;
+  }
+
+  void _evictPageControllers(int currentPage) {
+    final keepFrom = (currentPage - _cbzCacheRadius).clamp(1, _totalPages);
+    final keepTo = (currentPage + _cbzCacheRadius).clamp(1, _totalPages);
+
+    _transformControllers.removeWhere((page, ctrl) {
+      if (page < keepFrom || page > keepTo) {
+        ctrl.dispose();
+        return true;
+      }
+      return false;
+    });
+    _pageScales.removeWhere((page, _) => page < keepFrom || page > keepTo);
+  }
 
   @override
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
-    _transformationController = TransformationController();
     _zoomAnimController = AnimationController(
       vsync: this,
       duration: const Duration(milliseconds: 200),
@@ -118,7 +159,6 @@ class _ReaderPageState extends State<ReaderPage>
     _pageController = PageController();
     _loadBookmarks();
 
-    // Fullscreen: sembunyikan status bar, navigation bar, dan system UI
     SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
 
     final double initialProgress = widget.comic.progress;
@@ -196,6 +236,7 @@ class _ReaderPageState extends State<ReaderPage>
     }
     if (_isPdf) _evictPdfCache(page);
     if (_localPagePaths.isNotEmpty) _evictCbzCache(page);
+    _evictPageControllers(page);
   }
 
   // ── PDF cache ─────────────────────────────────────────────────────────────
@@ -270,28 +311,61 @@ class _ReaderPageState extends State<ReaderPage>
   // ── Navigation ────────────────────────────────────────────────────────────
 
   void _onPageChanged(int index) {
-    final int page = index + 1;
+    // FIX 5: Kalkulasi halaman aktual yang benar untuk dual-page mode
+    final int page;
+    final bool useDual = _dualPageMode && _readingMode != ReadingMode.vertical;
+    if (useDual) {
+      // slotIndex * 2 + 1 = halaman kiri pertama di slot ini
+      page = (index * 2 + 1).clamp(1, _totalPages);
+    } else {
+      page = index + 1;
+    }
+
     setState(() {
       _currentPage = page;
-      _currentScale = 1.0;
+      _sliderDragValue = null; // Reset drag value saat swipe selesai
     });
-    // Reset zoom saat ganti halaman
-    _transformationController.value = Matrix4.identity();
+
+    // FIX 2: Zoom sudah di-reset SEBELUM swipe oleh navigasi tap.
+    // _onPageChanged hanya perlu memastikan page yang baru tidak tersisa zoom
+    // dari sumber lain (mis. BookmarkJump).
+    _resetPageZoom(page);
+
     _preRenderAround(page);
     _saveProgress(page);
   }
 
   void _jumpToPage(int page) {
     if (_pageController.hasClients) {
-      _pageController.jumpToPage(page - 1);
+      final bool useDual =
+          _dualPageMode && _readingMode != ReadingMode.vertical;
+      final int targetIndex = useDual ? ((page - 1) ~/ 2) : page - 1;
+      _pageController.jumpToPage(targetIndex);
     }
     _preRenderAround(page);
   }
 
-  // ── Tap navigation (kiri/tengah/kanan) ───────────────────────────────────
+  // ── FIX 2: Pre-emptive zoom reset sebelum navigasi ────────────────────────
 
-  /// Zona kiri & kanan masing-masing 25% lebar layar.
-  /// Saat zoom aktif, tap tidak navigasi — biarkan InteractiveViewer handle pan.
+  /// Reset zoom halaman sekarang SEBELUM berpindah, sehingga tidak ada flash.
+  void _navigateNext() {
+    _resetPageZoom(_currentPage);
+    _pageController.nextPage(
+      duration: const Duration(milliseconds: 250),
+      curve: Curves.easeInOut,
+    );
+  }
+
+  void _navigatePrev() {
+    _resetPageZoom(_currentPage);
+    _pageController.previousPage(
+      duration: const Duration(milliseconds: 250),
+      curve: Curves.easeInOut,
+    );
+  }
+
+  // ── Tap navigation ────────────────────────────────────────────────────────
+
   void _handleTapNavigation(Offset localPosition) {
     if (_isZoomed) return;
 
@@ -302,26 +376,42 @@ class _ReaderPageState extends State<ReaderPage>
     final bool tapRight = localPosition.dx > screenWidth - zoneWidth;
 
     if (!tapLeft && !tapRight) {
-      // Tap tengah: toggle UI
       setState(() => _showUI = !_showUI);
       return;
     }
 
-    // Manga = RTL: kiri → next, kanan → prev
     final bool goNext = _isManga ? tapLeft : tapRight;
     final bool goPrev = _isManga ? tapRight : tapLeft;
 
-    if (goNext && _currentPage < _totalPages) {
-      _pageController.nextPage(
-        duration: const Duration(milliseconds: 250),
-        curve: Curves.easeInOut,
-      );
-    } else if (goPrev && _currentPage > 1) {
-      _pageController.previousPage(
-        duration: const Duration(milliseconds: 250),
-        curve: Curves.easeInOut,
-      );
+    if (goNext) {
+      if (_currentPage < _totalPages) {
+        // FIX 4: Flash overlay kanan
+        _showTapFlash(isRight: true);
+        // FIX 2: Reset zoom sebelum pindah
+        _navigateNext();
+      } else {
+        // FIX 6: Haptic di boundary terakhir
+        HapticFeedback.lightImpact();
+      }
+    } else if (goPrev) {
+      if (_currentPage > 1) {
+        // FIX 4: Flash overlay kiri
+        _showTapFlash(isRight: false);
+        // FIX 2: Reset zoom sebelum pindah
+        _navigatePrev();
+      } else {
+        // FIX 6: Haptic di boundary pertama
+        HapticFeedback.lightImpact();
+      }
     }
+  }
+
+  // FIX 4: Tampilkan flash sebentar di sisi yang di-tap
+  void _showTapFlash({required bool isRight}) {
+    setState(() => _tapFlashRight = isRight);
+    Future.delayed(const Duration(milliseconds: 120), () {
+      if (mounted) setState(() => _tapFlashRight = null);
+    });
   }
 
   // ── Bookmark ──────────────────────────────────────────────────────────────
@@ -631,7 +721,12 @@ class _ReaderPageState extends State<ReaderPage>
       ComicService.closeArchive(widget.comic.localPath!);
     }
 
-    _transformationController.dispose();
+    // FIX 1: Dispose semua per-page TransformationController
+    for (final ctrl in _transformControllers.values) {
+      ctrl.dispose();
+    }
+    _transformControllers.clear();
+
     _zoomAnimController?.dispose();
 
     ReadingHistoryService.saveEntry(
@@ -659,9 +754,9 @@ class _ReaderPageState extends State<ReaderPage>
       backgroundColor: Colors.black,
       body: Stack(
         children: [
-          // GestureDetector di sini dihapus — toggle UI & navigasi
-          // sekarang ditangani oleh _handleTapNavigation di dalam setiap halaman.
           _buildReaderContent(),
+          // FIX 4: Tap zone flash overlays
+          if (_tapFlashRight != null) _buildTapZoneFlash(_tapFlashRight!),
           AnimatedPositioned(
             duration: const Duration(milliseconds: 300),
             top: _showUI ? 0 : -120,
@@ -677,6 +772,36 @@ class _ReaderPageState extends State<ReaderPage>
             child: _buildBottomBar(context),
           ),
         ],
+      ),
+    );
+  }
+
+  // FIX 4: Overlay flash semi-transparan di zona yang di-tap
+  Widget _buildTapZoneFlash(bool isRight) {
+    final screenWidth = MediaQuery.of(context).size.width;
+    final zoneWidth = screenWidth * 0.25;
+    return Positioned(
+      top: 0,
+      bottom: 0,
+      left: isRight ? screenWidth - zoneWidth : 0,
+      width: zoneWidth,
+      child: IgnorePointer(
+        child: AnimatedOpacity(
+          opacity: _tapFlashRight != null ? 1.0 : 0.0,
+          duration: const Duration(milliseconds: 80),
+          child: Container(
+            decoration: BoxDecoration(
+              gradient: LinearGradient(
+                begin: isRight ? Alignment.centerRight : Alignment.centerLeft,
+                end: isRight ? Alignment.centerLeft : Alignment.centerRight,
+                colors: [
+                  Colors.white.withValues(alpha: 0.12),
+                  Colors.transparent,
+                ],
+              ),
+            ),
+          ),
+        ),
       ),
     );
   }
@@ -755,38 +880,41 @@ class _ReaderPageState extends State<ReaderPage>
                 ? const NeverScrollableScrollPhysics()
                 : const BouncingScrollPhysics(),
         onPageChanged: (slotIndex) {
-          _onPageChanged(useDual ? slotIndex * 2 : slotIndex);
+          _onPageChanged(slotIndex);
         },
         itemCount: itemCount,
         itemBuilder: (context, slotIndex) {
-          if (!useDual) return _buildZoomablePage(slotIndex, primaryColor);
+          if (!useDual) return _buildZoomablePage(slotIndex + 1, primaryColor);
 
-          // Dual-page
+          // FIX 5: Kalkulasi halaman dual-page yang benar
           final int leftPage = _isManga ? slotIndex * 2 + 2 : slotIndex * 2 + 1;
           final int rightPage =
               _isManga ? slotIndex * 2 + 1 : slotIndex * 2 + 2;
+          // Gunakan halaman kiri (atau kanan jika manga) sebagai page number
+          // untuk controller — konsisten dengan _onPageChanged
+          final int primaryPage = slotIndex * 2 + 1;
+          final ctrl = _controllerForPage(primaryPage);
 
           return GestureDetector(
             onTapUp: (details) => _handleTapNavigation(details.localPosition),
-            onDoubleTapDown: _handleDoubleTap,
+            onDoubleTapDown:
+                (details) => _handleDoubleTap(details, primaryPage),
             onDoubleTap: () {},
             child: InteractiveViewer(
-              transformationController: _transformationController,
+              transformationController: ctrl,
               minScale: 1.0,
               maxScale: 5.0,
               boundaryMargin: const EdgeInsets.all(20),
               onInteractionUpdate: (details) {
-                final scale =
-                    _transformationController.value.getMaxScaleOnAxis();
-                if ((scale - _currentScale).abs() > 0.01) {
-                  setState(() => _currentScale = scale);
+                final scale = ctrl.value.getMaxScaleOnAxis();
+                if ((_pageScales[primaryPage] ?? 1.0 - scale).abs() > 0.01) {
+                  setState(() => _pageScales[primaryPage] = scale);
                 }
               },
               onInteractionEnd: (_) {
-                final scale =
-                    _transformationController.value.getMaxScaleOnAxis();
+                final scale = ctrl.value.getMaxScaleOnAxis();
                 if (scale <= 1.05) {
-                  setState(() => _currentScale = 1.0);
+                  setState(() => _pageScales[primaryPage] = 1.0);
                 }
               },
               child: Row(
@@ -814,17 +942,17 @@ class _ReaderPageState extends State<ReaderPage>
 
   // ── Double-tap zoom ───────────────────────────────────────────────────────
 
-  void _handleDoubleTap(TapDownDetails details) {
-    final bool isZoomedIn = _currentScale > 1.05;
+  // FIX 1: _handleDoubleTap sekarang menerima pageNumber eksplisit
+  void _handleDoubleTap(TapDownDetails details, int pageNumber) {
+    final ctrl = _controllerForPage(pageNumber);
+    final double currentScale = _pageScales[pageNumber] ?? 1.0;
+    final bool isZoomedIn = currentScale > 1.05;
 
     if (isZoomedIn) {
-      // Zoom out kembali ke normal
-      _animateZoom(Matrix4.identity());
-      setState(() => _currentScale = 1.0);
+      _animateZoom(Matrix4.identity(), ctrl, pageNumber, targetScale: 1.0);
       return;
     }
 
-    // Zoom in ke titik yang di-tap
     final Offset tap = details.localPosition;
     final double x = -tap.dx * (_doubleTapZoomScale - 1);
     final double y = -tap.dy * (_doubleTapZoomScale - 1);
@@ -833,70 +961,74 @@ class _ReaderPageState extends State<ReaderPage>
           ..translate(x, y)
           ..scale(_doubleTapZoomScale);
 
-    _animateZoom(zoomed);
-    setState(() => _currentScale = _doubleTapZoomScale);
+    _animateZoom(zoomed, ctrl, pageNumber, targetScale: _doubleTapZoomScale);
   }
 
-  void _animateZoom(Matrix4 target) {
+  void _animateZoom(
+    Matrix4 target,
+    TransformationController ctrl,
+    int pageNumber, {
+    required double targetScale,
+  }) {
     _zoomAnimController!.stop();
-    _zoomAnimation = Matrix4Tween(
-      begin: _transformationController.value,
-      end: target,
-    ).animate(
+    _activeAnimTarget = ctrl;
+    _zoomAnimation = Matrix4Tween(begin: ctrl.value, end: target).animate(
       CurvedAnimation(parent: _zoomAnimController!, curve: Curves.easeInOut),
     )..addListener(() {
-      _transformationController.value = _zoomAnimation!.value;
-      // Sync _currentScale real-time selama animasi
-      final scale = _transformationController.value.getMaxScaleOnAxis();
-      if ((scale - _currentScale).abs() > 0.01) {
-        setState(() => _currentScale = scale);
+      if (_activeAnimTarget == ctrl) {
+        ctrl.value = _zoomAnimation!.value;
+        final scale = ctrl.value.getMaxScaleOnAxis();
+        if ((_pageScales[pageNumber] ?? 1.0 - scale).abs() > 0.01) {
+          setState(() => _pageScales[pageNumber] = scale);
+        }
       }
     });
     _zoomAnimController!
       ..reset()
-      ..forward();
+      ..forward().then((_) {
+        // Pastikan scale tepat di akhir animasi
+        if (mounted) {
+          setState(() => _pageScales[pageNumber] = targetScale);
+        }
+      });
   }
 
   // ── Zoomable page (single-page mode) ─────────────────────────────────────
 
-  /// Setiap halaman punya InteractiveViewer-nya sendiri sehingga:
-  /// - Zoom state independen per halaman (reset otomatis saat ganti halaman)
-  /// - Pan saat zoom tidak direbut PageView
-  /// - Pinch & double-tap tidak berkonflik dengan swipe navigasi
-  Widget _buildZoomablePage(int index, Color primaryColor) {
+  // FIX 1: Terima pageNumber (1-based) langsung, bukan index
+  Widget _buildZoomablePage(int pageNumber, Color primaryColor) {
+    // FIX 1: Ambil/buat controller khusus untuk halaman ini
+    final ctrl = _controllerForPage(pageNumber);
+
     return GestureDetector(
-      // onTapUp untuk navigasi kiri/tengah/kanan
       onTapUp: (details) => _handleTapNavigation(details.localPosition),
-      onDoubleTapDown: _handleDoubleTap,
-      onDoubleTap: () {}, // wajib ada agar onDoubleTapDown ter-trigger
+      onDoubleTapDown: (details) => _handleDoubleTap(details, pageNumber),
+      onDoubleTap: () {},
       child: InteractiveViewer(
-        transformationController: _transformationController,
+        transformationController: ctrl,
         minScale: 1.0,
         maxScale: 5.0,
         boundaryMargin: const EdgeInsets.all(20),
-        // Pinch zoom sudah aktif secara native di InteractiveViewer
         onInteractionUpdate: (details) {
-          final scale = _transformationController.value.getMaxScaleOnAxis();
-          if ((scale - _currentScale).abs() > 0.01) {
-            setState(() => _currentScale = scale);
+          final scale = ctrl.value.getMaxScaleOnAxis();
+          if ((_pageScales[pageNumber] ?? 1.0 - scale).abs() > 0.01) {
+            setState(() => _pageScales[pageNumber] = scale);
           }
         },
         onInteractionEnd: (_) {
-          final scale = _transformationController.value.getMaxScaleOnAxis();
+          final scale = ctrl.value.getMaxScaleOnAxis();
           if (scale <= 1.05) {
-            setState(() => _currentScale = 1.0);
+            setState(() => _pageScales[pageNumber] = 1.0);
           }
         },
-        child: _buildPageContent(index, primaryColor),
+        child: _buildPageContent(pageNumber - 1, primaryColor),
       ),
     );
   }
 
-  /// Konten halaman murni (tanpa zoom/gesture wrapper).
   Widget _buildPageContent(int index, Color primaryColor) {
     final int pageNumber = index + 1;
 
-    // ── PDF ────────────────────────────────────────────────────────────────
     if (_isPdf) {
       final Uint8List? cached = _pdfPageCache[pageNumber];
       if (cached != null) {
@@ -913,7 +1045,6 @@ class _ReaderPageState extends State<ReaderPage>
       return Center(child: CircularProgressIndicator(color: primaryColor));
     }
 
-    // ── CBZ / CBR ──────────────────────────────────────────────────────────
     if (_localPagePaths.isNotEmpty) {
       final Uint8List? cached = _cbzPageCache[pageNumber];
       if (cached != null) {
@@ -934,7 +1065,6 @@ class _ReaderPageState extends State<ReaderPage>
       return Center(child: CircularProgressIndicator(color: primaryColor));
     }
 
-    // ── Network pages ──────────────────────────────────────────────────────
     if (widget.comic.pages.isNotEmpty && index < widget.comic.pages.length) {
       return CachedNetworkImage(
         imageUrl: widget.comic.pages[index],
@@ -1114,6 +1244,12 @@ class _ReaderPageState extends State<ReaderPage>
   }
 
   Widget _buildSlider(Color primaryColor, int current, int total) {
+    // FIX 3: Gunakan _sliderDragValue saat drag; current saat tidak drag
+    final double sliderValue = (_sliderDragValue ?? current.toDouble()).clamp(
+      1.0,
+      total.toDouble(),
+    );
+
     return SliderTheme(
       data: SliderTheme.of(context).copyWith(
         trackHeight: 2,
@@ -1124,13 +1260,16 @@ class _ReaderPageState extends State<ReaderPage>
         thumbColor: Colors.white,
       ),
       child: Slider(
-        value: current.toDouble(),
+        value: sliderValue,
         min: 1,
         max: total.toDouble(),
+        // FIX 3: onChanged hanya update local state — TIDAK jumpToPage
         onChanged: (value) {
-          setState(() => _currentPage = value.toInt());
+          setState(() => _sliderDragValue = value);
         },
+        // FIX 3: jumpToPage hanya saat drag selesai
         onChangeEnd: (value) {
+          setState(() => _sliderDragValue = null);
           _jumpToPage(value.toInt());
         },
       ),
@@ -1250,8 +1389,11 @@ class _ReaderPageState extends State<ReaderPage>
                               onChanged: (_) {
                                 setState(() {
                                   _dualPageMode = !_dualPageMode;
+                                  final bool useDual =
+                                      _dualPageMode &&
+                                      _readingMode != ReadingMode.vertical;
                                   _pageController.jumpToPage(
-                                    _dualPageMode
+                                    useDual
                                         ? ((_currentPage - 1) ~/ 2)
                                         : _currentPage - 1,
                                   );
