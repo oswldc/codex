@@ -50,7 +50,6 @@ class ComicService {
 
       if (existingIds.contains(id)) continue;
 
-      // ─── Parse series title & volume number dari nama file ────────────────
       final seriesTitle = ComicTitleParser.parseSeriesTitle(name);
       final volumeNumber = ComicTitleParser.parseVolumeNumber(name);
 
@@ -67,7 +66,11 @@ class ComicService {
         }
       } else if (type == ComicFileType.pdf) {
         try {
-          final thumb = await _extractFirstPDFPage(filePath);
+          // Gunakan resolusi rendah untuk thumbnail saja
+          final thumb = await _extractFirstPDFPage(
+            filePath,
+            thumbnailOnly: true,
+          );
           if (thumb != null) {
             thumbnailPath = await getThumbnailPath(fileName);
             await File(thumbnailPath).writeAsBytes(thumb);
@@ -127,9 +130,6 @@ class ComicService {
 
   // ─── Group by Series ──────────────────────────────────────────────────────
 
-  /// Kelompokkan flat list Comic menjadi list ComicSeries.
-  /// Komik dengan seriesTitle yang sama → satu ComicSeries.
-  /// Setiap series diurutkan volume-nya dari kecil ke besar.
   static List<ComicSeries> groupBySeries(List<Comic> comics) {
     final Map<String, List<Comic>> grouped = {};
 
@@ -145,7 +145,6 @@ class ComicService {
           return ComicSeries(seriesTitle: entry.key, volumes: volumes);
         }).toList();
 
-    // Urutkan series: yang paling baru dibaca di atas
     seriesList.sort((a, b) {
       final aRead = a.lastRead ?? 0;
       final bRead = b.lastRead ?? 0;
@@ -191,7 +190,6 @@ class ComicService {
     }
   }
 
-  /// Hapus semua volume dalam satu series sekaligus
   static Future<void> deleteSeries(
     ComicSeries series, {
     bool deleteFiles = false,
@@ -293,7 +291,6 @@ class ComicService {
     return null;
   }
 
-  /// Muat semua halaman CBZ sekaligus (dipakai di bagian lain jika perlu).
   static Future<List<Uint8List>> getPagesFromCBZ(String path) async {
     return compute(_extractCBZPages, path);
   }
@@ -332,11 +329,8 @@ class ComicService {
     }
   }
 
-  // ─── CBZ lazy loading (dipakai ReaderPage untuk hemat memori) ─────────────
+  // ─── CBZ lazy loading ─────────────────────────────────────────────────────
 
-  /// Cache Archive yang sudah dibuka — key: path file CBZ/CBR.
-  /// Dibuka sekali saat getPagePathsFromCBZ, dipakai ulang oleh getPageBytes,
-  /// ditutup saat closeArchive dipanggil dari ReaderPage.dispose().
   static final Map<String, Archive> _openArchives = {};
 
   static Archive? _getOrOpenArchive(String path) {
@@ -352,15 +346,10 @@ class ComicService {
     }
   }
 
-  /// Tutup dan buang Archive dari cache. Dipanggil dari ReaderPage.dispose()
-  /// agar memory dibebaskan saat reader ditutup.
   static void closeArchive(String path) {
     _openArchives.remove(path);
   }
 
-  /// Kembalikan daftar nama entry untuk semua halaman gambar dalam CBZ/CBR.
-  /// Archive dibuka di sini dan di-cache — getPageBytes akan memakai ulang
-  /// archive yang sama tanpa baca ulang dari disk.
   static Future<List<String>> getPagePathsFromCBZ(String path) async {
     final archive = _getOrOpenArchive(path);
     if (archive == null) return [];
@@ -386,7 +375,6 @@ class ComicService {
     return imageEntries.map((f) => f.name).toList();
   }
 
-  /// Decode satu halaman dari archive yang sudah di-cache.
   static Future<Uint8List> getPageBytes(
     String archivePath,
     String entryName,
@@ -408,27 +396,175 @@ class ComicService {
     return Uint8List(0);
   }
 
-  static Future<Uint8List?> _extractFirstPDFPage(String path) async {
-    PdfDocument? document;
-    try {
-      document = await PdfDocument.openFile(path);
-      if (document.pagesCount == 0) return null;
+  // ─── PDF Document Cache ───────────────────────────────────────────────────
 
-      final page = await document.getPage(1);
+  /// Cache PdfDocument yang sudah dibuka — key: path file PDF.
+  /// Dibuka sekali saat getPdfPageCount atau getPdfPageImage pertama kali,
+  /// dipakai ulang untuk semua halaman, ditutup saat closePdfDocument
+  /// dipanggil dari ReaderPage.dispose().
+  static final Map<String, PdfDocument> _openPdfDocuments = {};
+
+  /// Cache hasil render halaman PDF — key: "$path:$pageNumber:$scale".
+  /// Halaman di luar radius ±[_pdfCacheRadius] dari halaman aktif di-evict
+  /// melalui evictPdfPageCache().
+  static final Map<String, Uint8List> _pdfPageCache = {};
+
+  static const int _pdfCacheRadius = 3;
+
+  /// Buka PDF (atau ambil dari cache) dan kembalikan jumlah halaman.
+  static Future<int> getPdfPageCount(String path) async {
+    final doc = await _getOrOpenPdfDocument(path);
+    return doc?.pagesCount ?? 0;
+  }
+
+  static Future<PdfDocument?> _getOrOpenPdfDocument(String path) async {
+    if (_openPdfDocuments.containsKey(path)) return _openPdfDocuments[path];
+    try {
+      final doc = await PdfDocument.openFile(path);
+      _openPdfDocuments[path] = doc;
+      return doc;
+    } catch (e) {
+      debugPrint('PDF open error: $e');
+      return null;
+    }
+  }
+
+  /// Render satu halaman PDF dengan cache.
+  ///
+  /// [pageNumber] dimulai dari 1.
+  /// [scale] adalah faktor skala render terhadap ukuran asli halaman.
+  /// Gunakan scale=1.5 untuk reader, scale=0.5 untuk thumbnail.
+  static Future<Uint8List?> getPdfPageImage(
+    String path,
+    int pageNumber, {
+    double scale = 1.5,
+  }) async {
+    final cacheKey = '$path:$pageNumber:$scale';
+    if (_pdfPageCache.containsKey(cacheKey)) {
+      return _pdfPageCache[cacheKey];
+    }
+
+    final doc = await _getOrOpenPdfDocument(path);
+    if (doc == null) return null;
+
+    try {
+      final page = await doc.getPage(pageNumber);
       final pageImage = await page.render(
-        width: page.width * 2,
-        height: page.height * 2,
+        width: page.width * scale,
+        height: page.height * scale,
         format: PdfPageImageFormat.jpeg,
         backgroundColor: '#ffffff',
+        quality: 85,
       );
       await page.close();
 
+      final bytes = pageImage?.bytes;
+      if (bytes != null) {
+        _pdfPageCache[cacheKey] = bytes;
+      }
+      return bytes;
+    } catch (e) {
+      debugPrint('PDF page render error (page $pageNumber): $e');
+      return null;
+    }
+  }
+
+  /// Pre-fetch halaman di sekitar [currentPage] secara background.
+  /// Dipanggil dari ReaderPage setelah halaman aktif selesai ditampilkan.
+  static Future<void> prefetchPdfPages(
+    String path,
+    int currentPage,
+    int totalPages, {
+    double scale = 1.5,
+    int radius = 2,
+  }) async {
+    final start = (currentPage - radius).clamp(1, totalPages);
+    final end = (currentPage + radius).clamp(1, totalPages);
+
+    for (int i = start; i <= end; i++) {
+      if (i == currentPage) continue;
+      final cacheKey = '$path:$i:$scale';
+      if (_pdfPageCache.containsKey(cacheKey)) continue;
+      // Fire-and-forget, tidak perlu await
+      getPdfPageImage(path, i, scale: scale).ignore();
+    }
+  }
+
+  /// Buang cache halaman yang terlalu jauh dari halaman aktif agar
+  /// memory tidak membengkak saat baca PDF panjang.
+  static void evictPdfPageCache(
+    String path,
+    int currentPage, {
+    double scale = 1.5,
+  }) {
+    final keysToRemove =
+        _pdfPageCache.keys.where((key) {
+          if (!key.startsWith('$path:')) return false;
+          final parts = key.split(':');
+          // format: "path:pageNumber:scale"
+          if (parts.length < 3) return false;
+          final pageNum = int.tryParse(parts[parts.length - 2]);
+          if (pageNum == null) return false;
+          return (pageNum - currentPage).abs() > _pdfCacheRadius;
+        }).toList();
+
+    for (final key in keysToRemove) {
+      _pdfPageCache.remove(key);
+    }
+  }
+
+  /// Tutup PdfDocument dan bersihkan semua cache halaman untuk path ini.
+  /// Dipanggil dari ReaderPage.dispose().
+  static Future<void> closePdfDocument(String path) async {
+    final doc = _openPdfDocuments.remove(path);
+    await doc?.close();
+
+    // Bersihkan semua cache halaman untuk dokumen ini
+    _pdfPageCache.removeWhere((key, _) => key.startsWith('$path:'));
+  }
+
+  // ─── PDF Thumbnail (internal) ─────────────────────────────────────────────
+
+  /// Ekstrak halaman pertama PDF untuk thumbnail.
+  /// [thumbnailOnly] = true → resolusi rendah (lebar maks 400px).
+  static Future<Uint8List?> _extractFirstPDFPage(
+    String path, {
+    bool thumbnailOnly = false,
+  }) async {
+    PdfDocument? document;
+    final bool ownDocument = !_openPdfDocuments.containsKey(path);
+    try {
+      document =
+          thumbnailOnly
+              // Untuk thumbnail, buka dokumen sementara tanpa cache
+              ? await PdfDocument.openFile(path)
+              : await _getOrOpenPdfDocument(path);
+
+      if (document == null || document.pagesCount == 0) return null;
+
+      final page = await document.getPage(1);
+
+      // Untuk thumbnail: skala ke lebar maks 400px agar tidak boros memori
+      final double scale =
+          thumbnailOnly ? (400.0 / page.width).clamp(0.1, 1.0) : 2.0;
+
+      final pageImage = await page.render(
+        width: page.width * scale,
+        height: page.height * scale,
+        format: PdfPageImageFormat.jpeg,
+        backgroundColor: '#ffffff',
+        quality: thumbnailOnly ? 80 : 90,
+      );
+      await page.close();
       return pageImage?.bytes;
     } catch (e) {
       debugPrint('PDF thumbnail error: $e');
       return null;
     } finally {
-      await document?.close();
+      // Tutup hanya jika dokumen ini dibuka sementara untuk thumbnail
+      if (thumbnailOnly && ownDocument) {
+        await document?.close();
+      }
     }
   }
 }

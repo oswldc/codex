@@ -56,6 +56,9 @@ class ReaderPage extends StatefulWidget {
 
 enum ReadingMode { horizontal, vertical, manga }
 
+// Enum untuk melacak sisi tepi gambar yang sedang "mentok" saat pan
+enum _EdgeSide { none, left, right, top, bottom }
+
 class _ReaderPageState extends State<ReaderPage>
     with WidgetsBindingObserver, TickerProviderStateMixin {
   bool _showUI = true;
@@ -80,25 +83,33 @@ class _ReaderPageState extends State<ReaderPage>
 
   late PageController _pageController;
 
-  // FIX 1: Per-page TransformationController — tidak ada lagi zoom leak antar halaman
+  // Per-page TransformationController
   final Map<int, TransformationController> _transformControllers = {};
-  // Track scale per halaman agar _isZoomed bisa cek halaman yang aktif
   final Map<int, double> _pageScales = {};
 
-  // FIX 3: Local slider value — dipakai hanya untuk display saat drag
+  // Local slider value
   double? _sliderDragValue;
 
-  // FIX 4: Tap zone flash overlay state
-  // null = tidak ada flash, true = kanan/next, false = kiri/prev
+  // Tap zone flash overlay
   bool? _tapFlashRight;
 
-  // AnimationController untuk zoom double-tap, dipakai bersama per halaman
+  // AnimationController untuk zoom double-tap
   AnimationController? _zoomAnimController;
   Animation<Matrix4>? _zoomAnimation;
-  // Track controller mana yang sedang di-animasi
   TransformationController? _activeAnimTarget;
 
   static const double _doubleTapZoomScale = 1.5;
+
+  // ── ZOOM-AWARE NAVIGATION ─────────────────────────────────────────────────
+  // Melacak sisi tepi gambar yang mentok saat pan dalam kondisi zoom.
+  // Akumulasi delta overscroll — jika melebihi threshold, pindah halaman.
+  _EdgeSide _pannedEdge = _EdgeSide.none;
+  double _edgeOverscrollAccum = 0.0;
+  static const double _edgeNavThreshold = 60.0; // px sebelum pindah halaman
+  Offset? _panStartFocalPoint;
+
+  // Smooth swipe flag
+  bool _isSwiping = false;
 
   // Debounce save
   DateTime? _lastSaved;
@@ -111,8 +122,6 @@ class _ReaderPageState extends State<ReaderPage>
 
   bool get _isPdf => widget.comic.fileType == ComicFileType.pdf;
   bool get _isManga => _readingMode == ReadingMode.manga;
-
-  // FIX 1: Cek zoom dari halaman yang sedang aktif
   bool get _isZoomed => (_pageScales[_currentPage] ?? 1.0) > 1.05;
 
   // ── Controller per halaman ────────────────────────────────────────────────
@@ -126,16 +135,13 @@ class _ReaderPageState extends State<ReaderPage>
 
   void _resetPageZoom(int pageNumber) {
     final ctrl = _transformControllers[pageNumber];
-    if (ctrl != null) {
-      ctrl.value = Matrix4.identity();
-    }
+    if (ctrl != null) ctrl.value = Matrix4.identity();
     _pageScales[pageNumber] = 1.0;
   }
 
   void _evictPageControllers(int currentPage) {
     final keepFrom = (currentPage - _cbzCacheRadius).clamp(1, _totalPages);
     final keepTo = (currentPage + _cbzCacheRadius).clamp(1, _totalPages);
-
     _transformControllers.removeWhere((page, ctrl) {
       if (page < keepFrom || page > keepTo) {
         ctrl.dispose();
@@ -144,6 +150,35 @@ class _ReaderPageState extends State<ReaderPage>
       return false;
     });
     _pageScales.removeWhere((page, _) => page < keepFrom || page > keepTo);
+  }
+
+  // ── Deteksi tepi: apakah konten sudah mentok di sisi tertentu ────────────
+  //
+  // Membandingkan translasi saat ini dengan batas minimum yang diizinkan.
+  // Hasilnya adalah Set sisi yang sedang menyentuh batas viewport.
+  Set<_EdgeSide> _atEdge(TransformationController ctrl) {
+    if (!mounted) return {};
+    final double scale = ctrl.value.getMaxScaleOnAxis();
+    if (scale <= 1.05) return {};
+
+    final Size viewport = MediaQuery.of(context).size;
+    final double tx = ctrl.value.getTranslation().x;
+    final double ty = ctrl.value.getTranslation().y;
+    final double contentW = viewport.width * scale;
+    final double contentH = viewport.height * scale;
+
+    // tx = 0 → tepi kiri konten pas di tepi kiri viewport (mentok kiri)
+    // tx = viewport.width - contentW → mentok kanan
+    final double minTx = viewport.width - contentW;
+    final double minTy = viewport.height - contentH;
+    const double epsilon = 4.0;
+
+    final result = <_EdgeSide>{};
+    if (tx >= -epsilon) result.add(_EdgeSide.left);
+    if (tx <= minTx + epsilon) result.add(_EdgeSide.right);
+    if (ty >= -epsilon) result.add(_EdgeSide.top);
+    if (ty <= minTy + epsilon) result.add(_EdgeSide.bottom);
+    return result;
   }
 
   @override
@@ -207,12 +242,11 @@ class _ReaderPageState extends State<ReaderPage>
           if (_isPdf || _localPagePaths.isNotEmpty)
             _preRenderAround(targetPage);
         } else {
-          if (mounted) {
+          if (mounted)
             setState(() {
               _totalPages = 0;
               _isLoading = false;
             });
-          }
         }
       } catch (e) {
         debugPrint('Reader initState error: $e');
@@ -228,11 +262,10 @@ class _ReaderPageState extends State<ReaderPage>
     final int first = (page - radius).clamp(1, _totalPages);
     final int last = (page + radius).clamp(1, _totalPages);
     for (int p = first; p <= last; p++) {
-      if (_isPdf) {
+      if (_isPdf)
         _ensurePdfPageRendered(p);
-      } else if (_localPagePaths.isNotEmpty) {
+      else if (_localPagePaths.isNotEmpty)
         _ensureCbzPageDecoded(p);
-      }
     }
     if (_isPdf) _evictPdfCache(page);
     if (_localPagePaths.isNotEmpty) _evictCbzCache(page);
@@ -253,7 +286,6 @@ class _ReaderPageState extends State<ReaderPage>
     if (_pdfPagesRendering.contains(pageNumber)) return;
 
     _evictPdfCache(pageNumber);
-
     _pdfPagesRendering.add(pageNumber);
     try {
       final PdfPage page = await _pdfDocument!.getPage(pageNumber);
@@ -267,7 +299,7 @@ class _ReaderPageState extends State<ReaderPage>
 
       if (image != null && mounted) {
         _pdfPageCache[pageNumber] = image.bytes;
-        setState(() {});
+        if (!_isSwiping) setState(() {});
       }
     } catch (e) {
       debugPrint('PDF render error (page $pageNumber): $e');
@@ -299,7 +331,7 @@ class _ReaderPageState extends State<ReaderPage>
       );
       if (mounted) {
         _cbzPageCache[pageNumber] = bytes;
-        setState(() {});
+        if (!_isSwiping) setState(() {});
       }
     } catch (e) {
       debugPrint('CBZ decode error (page $pageNumber): $e');
@@ -311,26 +343,19 @@ class _ReaderPageState extends State<ReaderPage>
   // ── Navigation ────────────────────────────────────────────────────────────
 
   void _onPageChanged(int index) {
-    // FIX 5: Kalkulasi halaman aktual yang benar untuk dual-page mode
-    final int page;
     final bool useDual = _dualPageMode && _readingMode != ReadingMode.vertical;
-    if (useDual) {
-      // slotIndex * 2 + 1 = halaman kiri pertama di slot ini
-      page = (index * 2 + 1).clamp(1, _totalPages);
-    } else {
-      page = index + 1;
-    }
+    final int page =
+        useDual ? (index * 2 + 1).clamp(1, _totalPages) : index + 1;
 
     setState(() {
       _currentPage = page;
-      _sliderDragValue = null; // Reset drag value saat swipe selesai
+      _sliderDragValue = null;
+      _isSwiping = false;
+      _pannedEdge = _EdgeSide.none;
+      _edgeOverscrollAccum = 0.0;
     });
 
-    // FIX 2: Zoom sudah di-reset SEBELUM swipe oleh navigasi tap.
-    // _onPageChanged hanya perlu memastikan page yang baru tidak tersisa zoom
-    // dari sumber lain (mis. BookmarkJump).
     _resetPageZoom(page);
-
     _preRenderAround(page);
     _saveProgress(page);
   }
@@ -345,33 +370,39 @@ class _ReaderPageState extends State<ReaderPage>
     _preRenderAround(page);
   }
 
-  // ── FIX 2: Pre-emptive zoom reset sebelum navigasi ────────────────────────
-
-  /// Reset zoom halaman sekarang SEBELUM berpindah, sehingga tidak ada flash.
   void _navigateNext() {
     _resetPageZoom(_currentPage);
     _pageController.nextPage(
-      duration: const Duration(milliseconds: 250),
-      curve: Curves.easeInOut,
+      duration: const Duration(milliseconds: 180),
+      curve: Curves.easeOut,
     );
   }
 
   void _navigatePrev() {
     _resetPageZoom(_currentPage);
     _pageController.previousPage(
-      duration: const Duration(milliseconds: 250),
-      curve: Curves.easeInOut,
+      duration: const Duration(milliseconds: 180),
+      curve: Curves.easeOut,
     );
   }
 
   // ── Tap navigation ────────────────────────────────────────────────────────
 
   void _handleTapNavigation(Offset localPosition) {
-    if (_isZoomed) return;
+    if (_isZoomed) {
+      // Saat zoom aktif, tap hanya untuk toggle UI di zona tengah.
+      // Navigasi antar halaman dilakukan lewat edge-pan.
+      final double screenWidth = MediaQuery.of(context).size.width;
+      final double zoneWidth = screenWidth * 0.25;
+      final bool tapCenter =
+          localPosition.dx >= zoneWidth &&
+          localPosition.dx <= screenWidth - zoneWidth;
+      if (tapCenter) setState(() => _showUI = !_showUI);
+      return;
+    }
 
     final double screenWidth = MediaQuery.of(context).size.width;
     final double zoneWidth = screenWidth * 0.25;
-
     final bool tapLeft = localPosition.dx < zoneWidth;
     final bool tapRight = localPosition.dx > screenWidth - zoneWidth;
 
@@ -385,28 +416,141 @@ class _ReaderPageState extends State<ReaderPage>
 
     if (goNext) {
       if (_currentPage < _totalPages) {
-        // FIX 4: Flash overlay kanan
         _showTapFlash(isRight: true);
-        // FIX 2: Reset zoom sebelum pindah
         _navigateNext();
       } else {
-        // FIX 6: Haptic di boundary terakhir
         HapticFeedback.lightImpact();
       }
     } else if (goPrev) {
       if (_currentPage > 1) {
-        // FIX 4: Flash overlay kiri
         _showTapFlash(isRight: false);
-        // FIX 2: Reset zoom sebelum pindah
         _navigatePrev();
       } else {
-        // FIX 6: Haptic di boundary pertama
         HapticFeedback.lightImpact();
       }
     }
   }
 
-  // FIX 4: Tampilkan flash sebentar di sisi yang di-tap
+  // ── ZOOM-AWARE NAVIGATION: edge-pan handlers ──────────────────────────────
+
+  void _onInteractionStart(
+    ScaleStartDetails details,
+    TransformationController ctrl,
+  ) {
+    _panStartFocalPoint = details.focalPoint;
+    _pannedEdge = _EdgeSide.none;
+    _edgeOverscrollAccum = 0.0;
+  }
+
+  void _onInteractionUpdate(
+    ScaleUpdateDetails details,
+    TransformationController ctrl,
+    int pageNumber,
+  ) {
+    // Update skala untuk throttle setState
+    final scale = ctrl.value.getMaxScaleOnAxis();
+    final prev = _pageScales[pageNumber] ?? 1.0;
+    if ((prev - scale).abs() > 0.02) {
+      setState(() => _pageScales[pageNumber] = scale);
+    }
+
+    // Edge-pan hanya berlaku saat zoom aktif dan gesture satu jari
+    if (!_isZoomed || details.pointerCount != 1) {
+      if (details.pointerCount > 1) {
+        // Pinch gesture — reset akumulasi
+        _pannedEdge = _EdgeSide.none;
+        _edgeOverscrollAccum = 0.0;
+      }
+      return;
+    }
+
+    final Set<_EdgeSide> edges = _atEdge(ctrl);
+    final Offset delta = details.focalPointDelta;
+    final bool isHorizontal = _readingMode != ReadingMode.vertical;
+
+    if (isHorizontal) {
+      // Delta negatif (geser kiri) + konten mentok di kanan → ingin next
+      // Delta positif (geser kanan) + konten mentok di kiri → ingin prev
+      if (delta.dx < 0 && edges.contains(_EdgeSide.right)) {
+        if (_pannedEdge != _EdgeSide.right) {
+          _pannedEdge = _EdgeSide.right;
+          _edgeOverscrollAccum = 0.0;
+        }
+        _edgeOverscrollAccum += delta.dx.abs();
+      } else if (delta.dx > 0 && edges.contains(_EdgeSide.left)) {
+        if (_pannedEdge != _EdgeSide.left) {
+          _pannedEdge = _EdgeSide.left;
+          _edgeOverscrollAccum = 0.0;
+        }
+        _edgeOverscrollAccum += delta.dx.abs();
+      } else {
+        _pannedEdge = _EdgeSide.none;
+        _edgeOverscrollAccum = 0.0;
+      }
+    } else {
+      if (delta.dy < 0 && edges.contains(_EdgeSide.bottom)) {
+        if (_pannedEdge != _EdgeSide.bottom) {
+          _pannedEdge = _EdgeSide.bottom;
+          _edgeOverscrollAccum = 0.0;
+        }
+        _edgeOverscrollAccum += delta.dy.abs();
+      } else if (delta.dy > 0 && edges.contains(_EdgeSide.top)) {
+        if (_pannedEdge != _EdgeSide.top) {
+          _pannedEdge = _EdgeSide.top;
+          _edgeOverscrollAccum = 0.0;
+        }
+        _edgeOverscrollAccum += delta.dy.abs();
+      } else {
+        _pannedEdge = _EdgeSide.none;
+        _edgeOverscrollAccum = 0.0;
+      }
+    }
+  }
+
+  void _onInteractionEnd(ScaleEndDetails details, int pageNumber) {
+    final scale =
+        _transformControllers[pageNumber]?.value.getMaxScaleOnAxis() ?? 1.0;
+    if (scale <= 1.05) setState(() => _pageScales[pageNumber] = 1.0);
+
+    // Eksekusi navigasi jika akumulasi overscroll cukup
+    if (_isZoomed && _edgeOverscrollAccum >= _edgeNavThreshold) {
+      final bool isHorizontal = _readingMode != ReadingMode.vertical;
+
+      if (isHorizontal) {
+        // Tepi kanan mentok + dorong kiri = maju (kecuali manga: mundur)
+        final bool wantsNext = _pannedEdge == _EdgeSide.right;
+        final bool wantsPrev = _pannedEdge == _EdgeSide.left;
+        final bool goNext = _isManga ? wantsPrev : wantsNext;
+        final bool goPrev = _isManga ? wantsNext : wantsPrev;
+
+        if (goNext && _currentPage < _totalPages) {
+          HapticFeedback.lightImpact();
+          _navigateNext();
+        } else if (goPrev && _currentPage > 1) {
+          HapticFeedback.lightImpact();
+          _navigatePrev();
+        } else {
+          // Boundary — beri feedback tanpa pindah
+          HapticFeedback.lightImpact();
+        }
+      } else {
+        if (_pannedEdge == _EdgeSide.bottom && _currentPage < _totalPages) {
+          HapticFeedback.lightImpact();
+          _navigateNext();
+        } else if (_pannedEdge == _EdgeSide.top && _currentPage > 1) {
+          HapticFeedback.lightImpact();
+          _navigatePrev();
+        } else {
+          HapticFeedback.lightImpact();
+        }
+      }
+    }
+
+    _pannedEdge = _EdgeSide.none;
+    _edgeOverscrollAccum = 0.0;
+    _panStartFocalPoint = null;
+  }
+
   void _showTapFlash({required bool isRight}) {
     setState(() => _tapFlashRight = isRight);
     Future.delayed(const Duration(milliseconds: 120), () {
@@ -504,12 +648,9 @@ class _ReaderPageState extends State<ReaderPage>
       ui.Paint()..color = const Color(0xFF000000),
     );
 
-    if (leftImg != null) {
-      canvas.drawImage(leftImg, ui.Offset.zero, ui.Paint());
-    }
-    if (rightImg != null) {
+    if (leftImg != null) canvas.drawImage(leftImg, ui.Offset.zero, ui.Paint());
+    if (rightImg != null)
       canvas.drawImage(rightImg, ui.Offset(w.toDouble(), 0), ui.Paint());
-    }
 
     final picture = recorder.endRecording();
     final img = await picture.toImage(w * 2, h);
@@ -721,10 +862,7 @@ class _ReaderPageState extends State<ReaderPage>
       ComicService.closeArchive(widget.comic.localPath!);
     }
 
-    // FIX 1: Dispose semua per-page TransformationController
-    for (final ctrl in _transformControllers.values) {
-      ctrl.dispose();
-    }
+    for (final ctrl in _transformControllers.values) ctrl.dispose();
     _transformControllers.clear();
 
     _zoomAnimController?.dispose();
@@ -755,7 +893,6 @@ class _ReaderPageState extends State<ReaderPage>
       body: Stack(
         children: [
           _buildReaderContent(),
-          // FIX 4: Tap zone flash overlays
           if (_tapFlashRight != null) _buildTapZoneFlash(_tapFlashRight!),
           AnimatedPositioned(
             duration: const Duration(milliseconds: 300),
@@ -776,7 +913,6 @@ class _ReaderPageState extends State<ReaderPage>
     );
   }
 
-  // FIX 4: Overlay flash semi-transparan di zona yang di-tap
   Widget _buildTapZoneFlash(bool isRight) {
     final screenWidth = MediaQuery.of(context).size.width;
     final zoneWidth = screenWidth * 0.25;
@@ -866,8 +1002,15 @@ class _ReaderPageState extends State<ReaderPage>
     final bool useDual = _dualPageMode && _readingMode != ReadingMode.vertical;
     final int itemCount = useDual ? ((_totalPages + 1) ~/ 2) : _totalPages;
 
-    return Container(
-      color: Colors.black,
+    return NotificationListener<ScrollNotification>(
+      onNotification: (notification) {
+        if (notification is ScrollStartNotification) {
+          _isSwiping = true;
+        } else if (notification is ScrollEndNotification) {
+          if (_isSwiping) _isSwiping = false;
+        }
+        return false;
+      },
       child: PageView.builder(
         scrollDirection:
             _readingMode == ReadingMode.vertical
@@ -875,23 +1018,19 @@ class _ReaderPageState extends State<ReaderPage>
                 : Axis.horizontal,
         reverse: _isManga,
         controller: _pageController,
+        // PageView tetap diblokir saat zoom — navigasi via edge-pan
         physics:
             _isZoomed
                 ? const NeverScrollableScrollPhysics()
-                : const BouncingScrollPhysics(),
-        onPageChanged: (slotIndex) {
-          _onPageChanged(slotIndex);
-        },
+                : const ClampingScrollPhysics(),
+        onPageChanged: _onPageChanged,
         itemCount: itemCount,
         itemBuilder: (context, slotIndex) {
           if (!useDual) return _buildZoomablePage(slotIndex + 1, primaryColor);
 
-          // FIX 5: Kalkulasi halaman dual-page yang benar
           final int leftPage = _isManga ? slotIndex * 2 + 2 : slotIndex * 2 + 1;
           final int rightPage =
               _isManga ? slotIndex * 2 + 1 : slotIndex * 2 + 2;
-          // Gunakan halaman kiri (atau kanan jika manga) sebagai page number
-          // untuk controller — konsisten dengan _onPageChanged
           final int primaryPage = slotIndex * 2 + 1;
           final ctrl = _controllerForPage(primaryPage);
 
@@ -905,18 +1044,12 @@ class _ReaderPageState extends State<ReaderPage>
               minScale: 1.0,
               maxScale: 5.0,
               boundaryMargin: const EdgeInsets.all(20),
-              onInteractionUpdate: (details) {
-                final scale = ctrl.value.getMaxScaleOnAxis();
-                if ((_pageScales[primaryPage] ?? 1.0 - scale).abs() > 0.01) {
-                  setState(() => _pageScales[primaryPage] = scale);
-                }
-              },
-              onInteractionEnd: (_) {
-                final scale = ctrl.value.getMaxScaleOnAxis();
-                if (scale <= 1.05) {
-                  setState(() => _pageScales[primaryPage] = 1.0);
-                }
-              },
+              onInteractionStart:
+                  (details) => _onInteractionStart(details, ctrl),
+              onInteractionUpdate:
+                  (details) => _onInteractionUpdate(details, ctrl, primaryPage),
+              onInteractionEnd:
+                  (details) => _onInteractionEnd(details, primaryPage),
               child: Row(
                 children: [
                   Expanded(
@@ -942,7 +1075,6 @@ class _ReaderPageState extends State<ReaderPage>
 
   // ── Double-tap zoom ───────────────────────────────────────────────────────
 
-  // FIX 1: _handleDoubleTap sekarang menerima pageNumber eksplisit
   void _handleDoubleTap(TapDownDetails details, int pageNumber) {
     final ctrl = _controllerForPage(pageNumber);
     final double currentScale = _pageScales[pageNumber] ?? 1.0;
@@ -986,18 +1118,13 @@ class _ReaderPageState extends State<ReaderPage>
     _zoomAnimController!
       ..reset()
       ..forward().then((_) {
-        // Pastikan scale tepat di akhir animasi
-        if (mounted) {
-          setState(() => _pageScales[pageNumber] = targetScale);
-        }
+        if (mounted) setState(() => _pageScales[pageNumber] = targetScale);
       });
   }
 
   // ── Zoomable page (single-page mode) ─────────────────────────────────────
 
-  // FIX 1: Terima pageNumber (1-based) langsung, bukan index
   Widget _buildZoomablePage(int pageNumber, Color primaryColor) {
-    // FIX 1: Ambil/buat controller khusus untuk halaman ini
     final ctrl = _controllerForPage(pageNumber);
 
     return GestureDetector(
@@ -1009,18 +1136,10 @@ class _ReaderPageState extends State<ReaderPage>
         minScale: 1.0,
         maxScale: 5.0,
         boundaryMargin: const EdgeInsets.all(20),
-        onInteractionUpdate: (details) {
-          final scale = ctrl.value.getMaxScaleOnAxis();
-          if ((_pageScales[pageNumber] ?? 1.0 - scale).abs() > 0.01) {
-            setState(() => _pageScales[pageNumber] = scale);
-          }
-        },
-        onInteractionEnd: (_) {
-          final scale = ctrl.value.getMaxScaleOnAxis();
-          if (scale <= 1.05) {
-            setState(() => _pageScales[pageNumber] = 1.0);
-          }
-        },
+        onInteractionStart: (details) => _onInteractionStart(details, ctrl),
+        onInteractionUpdate:
+            (details) => _onInteractionUpdate(details, ctrl, pageNumber),
+        onInteractionEnd: (details) => _onInteractionEnd(details, pageNumber),
         child: _buildPageContent(pageNumber - 1, primaryColor),
       ),
     );
@@ -1244,7 +1363,6 @@ class _ReaderPageState extends State<ReaderPage>
   }
 
   Widget _buildSlider(Color primaryColor, int current, int total) {
-    // FIX 3: Gunakan _sliderDragValue saat drag; current saat tidak drag
     final double sliderValue = (_sliderDragValue ?? current.toDouble()).clamp(
       1.0,
       total.toDouble(),
@@ -1263,11 +1381,7 @@ class _ReaderPageState extends State<ReaderPage>
         value: sliderValue,
         min: 1,
         max: total.toDouble(),
-        // FIX 3: onChanged hanya update local state — TIDAK jumpToPage
-        onChanged: (value) {
-          setState(() => _sliderDragValue = value);
-        },
-        // FIX 3: jumpToPage hanya saat drag selesai
+        onChanged: (value) => setState(() => _sliderDragValue = value),
         onChangeEnd: (value) {
           setState(() => _sliderDragValue = null);
           _jumpToPage(value.toInt());
@@ -1377,54 +1491,53 @@ class _ReaderPageState extends State<ReaderPage>
                   ),
                   const SizedBox(height: 12),
                   StatefulBuilder(
-                    builder: (context, setSheetState) {
-                      return Column(
-                        children: [
-                          _buildSettingsRow(
-                            icon: Icons.auto_stories,
-                            label: '2 Halaman',
-                            subtitle: 'Tampilkan dua halaman berdampingan',
-                            trailing: Switch(
-                              value: _dualPageMode,
-                              onChanged: (_) {
-                                setState(() {
-                                  _dualPageMode = !_dualPageMode;
-                                  final bool useDual =
-                                      _dualPageMode &&
-                                      _readingMode != ReadingMode.vertical;
-                                  _pageController.jumpToPage(
-                                    useDual
-                                        ? ((_currentPage - 1) ~/ 2)
-                                        : _currentPage - 1,
-                                  );
-                                });
-                                setSheetState(() {});
-                              },
-                            ),
-                          ),
-                          const SizedBox(height: 8),
-                          _buildSettingsRow(
-                            icon: Icons.save_alt,
-                            label: 'Simpan ke Galeri',
-                            subtitle: 'Simpan halaman ini sebagai gambar',
-                            trailing: IconButton(
-                              icon: const Icon(
-                                Icons.chevron_right,
-                                color: Colors.white38,
+                    builder:
+                        (context, setSheetState) => Column(
+                          children: [
+                            _buildSettingsRow(
+                              icon: Icons.auto_stories,
+                              label: '2 Halaman',
+                              subtitle: 'Tampilkan dua halaman berdampingan',
+                              trailing: Switch(
+                                value: _dualPageMode,
+                                onChanged: (_) {
+                                  setState(() {
+                                    _dualPageMode = !_dualPageMode;
+                                    final bool useDual =
+                                        _dualPageMode &&
+                                        _readingMode != ReadingMode.vertical;
+                                    _pageController.jumpToPage(
+                                      useDual
+                                          ? ((_currentPage - 1) ~/ 2)
+                                          : _currentPage - 1,
+                                    );
+                                  });
+                                  setSheetState(() {});
+                                },
                               ),
-                              onPressed: () {
+                            ),
+                            const SizedBox(height: 8),
+                            _buildSettingsRow(
+                              icon: Icons.save_alt,
+                              label: 'Simpan ke Galeri',
+                              subtitle: 'Simpan halaman ini sebagai gambar',
+                              trailing: IconButton(
+                                icon: const Icon(
+                                  Icons.chevron_right,
+                                  color: Colors.white38,
+                                ),
+                                onPressed: () {
+                                  Navigator.pop(context);
+                                  _saveCurrentPageToGallery();
+                                },
+                              ),
+                              onTap: () {
                                 Navigator.pop(context);
                                 _saveCurrentPageToGallery();
                               },
                             ),
-                            onTap: () {
-                              Navigator.pop(context);
-                              _saveCurrentPageToGallery();
-                            },
-                          ),
-                        ],
-                      );
-                    },
+                          ],
+                        ),
                   ),
                   const SizedBox(height: 24),
                 ],
