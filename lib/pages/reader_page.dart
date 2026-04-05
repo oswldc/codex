@@ -2,6 +2,7 @@ import 'dart:convert';
 import 'dart:math' as math;
 import 'dart:ui' as ui;
 import 'dart:typed_data';
+import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:cached_network_image/cached_network_image.dart';
@@ -38,6 +39,34 @@ class Bookmark {
   );
 }
 
+// ── AllowMultipleScaleRecognizer ──────────────────────────────────────────────
+//
+// Saat pointerCount >= 2 (pinch), recognizer ini langsung memenangkan
+// kompetisi gesture sehingga PageView tidak sempat mencuri swipe.
+
+class _AllowMultipleScaleRecognizer extends ScaleGestureRecognizer {
+  _AllowMultipleScaleRecognizer({super.debugOwner});
+
+  int _pointerCount = 0;
+
+  @override
+  void addAllowedPointer(PointerDownEvent event) {
+    super.addAllowedPointer(event);
+    _pointerCount++;
+    // Saat pointer kedua turun, langsung menangkan kompetisi gesture
+    // sehingga PageView tidak sempat mencuri swipe pinch.
+    if (_pointerCount >= 2) {
+      acceptGesture(event.pointer);
+    }
+  }
+
+  @override
+  void didStopTrackingLastPointer(int pointer) {
+    _pointerCount = 0;
+    super.didStopTrackingLastPointer(pointer);
+  }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 
 class ReaderPage extends StatefulWidget {
@@ -56,26 +85,22 @@ class ReaderPage extends StatefulWidget {
 
 enum ReadingMode { horizontal, vertical, manga }
 
-// Enum untuk melacak sisi tepi gambar yang sedang "mentok" saat pan
-enum _EdgeSide { none, left, right, top, bottom }
-
 class _ReaderPageState extends State<ReaderPage>
     with WidgetsBindingObserver, TickerProviderStateMixin {
   bool _showUI = true;
   int _currentPage = 1;
   int _totalPages = -1;
 
-  // For CBZ/CBR: lazy per-page cache
+  // For CBZ/CBR: lazy per-page cache via ValueNotifier
   List<String> _localPagePaths = [];
-  final Map<int, Uint8List> _cbzPageCache = {};
+  final Map<int, ValueNotifier<Uint8List?>> _cbzNotifiers = {};
   final Set<int> _cbzPagesDecoding = {};
   static const int _cbzCacheRadius = 10;
 
-  // For PDF: lazy per-page cache + shared document
+  // For PDF: lazy per-page cache via ValueNotifier + shared document
   PdfDocument? _pdfDocument;
-  final Map<int, Uint8List> _pdfPageCache = {};
+  final Map<int, ValueNotifier<Uint8List?>> _pdfNotifiers = {};
   final Set<int> _pdfPagesRendering = {};
-  static const int _pdfCacheRadius = 10;
 
   bool _isLoading = false;
   String _loadingMessage = 'Preparing your comic...';
@@ -83,33 +108,18 @@ class _ReaderPageState extends State<ReaderPage>
 
   late PageController _pageController;
 
-  // Per-page TransformationController
-  final Map<int, TransformationController> _transformControllers = {};
-  final Map<int, double> _pageScales = {};
+  // Per-page zoom state (Matrix4 via ValueNotifier)
+  final Map<int, ValueNotifier<Matrix4>> _zoomNotifiers = {};
+
+  // FIX #2: ValueNotifier<bool> untuk physics PageView agar reaktif tanpa
+  // menunggu setState parent selesai rebuild.
+  final ValueNotifier<bool> _pageScrollLocked = ValueNotifier<bool>(false);
 
   // Local slider value
   double? _sliderDragValue;
 
   // Tap zone flash overlay
   bool? _tapFlashRight;
-
-  // AnimationController untuk zoom double-tap
-  AnimationController? _zoomAnimController;
-  Animation<Matrix4>? _zoomAnimation;
-  TransformationController? _activeAnimTarget;
-
-  static const double _doubleTapZoomScale = 1.5;
-
-  // ── ZOOM-AWARE NAVIGATION ─────────────────────────────────────────────────
-  // Melacak sisi tepi gambar yang mentok saat pan dalam kondisi zoom.
-  // Akumulasi delta overscroll — jika melebihi threshold, pindah halaman.
-  _EdgeSide _pannedEdge = _EdgeSide.none;
-  double _edgeOverscrollAccum = 0.0;
-  static const double _edgeNavThreshold = 60.0; // px sebelum pindah halaman
-  Offset? _panStartFocalPoint;
-
-  // Smooth swipe flag
-  bool _isSwiping = false;
 
   // Debounce save
   DateTime? _lastSaved;
@@ -122,73 +132,74 @@ class _ReaderPageState extends State<ReaderPage>
 
   bool get _isPdf => widget.comic.fileType == ComicFileType.pdf;
   bool get _isManga => _readingMode == ReadingMode.manga;
-  bool get _isZoomed => (_pageScales[_currentPage] ?? 1.0) > 1.05;
 
-  // ── Controller per halaman ────────────────────────────────────────────────
+  bool _isPageZoomed(int pageNumber) {
+    final m = _zoomNotifiers[pageNumber]?.value;
+    if (m == null) return false;
+    return m.getMaxScaleOnAxis() > 1.05;
+  }
 
-  TransformationController _controllerForPage(int pageNumber) {
-    return _transformControllers.putIfAbsent(
+  // ── ValueNotifier helpers ─────────────────────────────────────────────────
+
+  ValueNotifier<Uint8List?> _cbzNotifierFor(int pageNumber) {
+    return _cbzNotifiers.putIfAbsent(
       pageNumber,
-      () => TransformationController(),
+      () => ValueNotifier<Uint8List?>(null),
     );
   }
 
-  void _resetPageZoom(int pageNumber) {
-    final ctrl = _transformControllers[pageNumber];
-    if (ctrl != null) ctrl.value = Matrix4.identity();
-    _pageScales[pageNumber] = 1.0;
+  ValueNotifier<Uint8List?> _pdfNotifierFor(int pageNumber) {
+    return _pdfNotifiers.putIfAbsent(
+      pageNumber,
+      () => ValueNotifier<Uint8List?>(null),
+    );
   }
 
-  void _evictPageControllers(int currentPage) {
+  ValueNotifier<Matrix4> _zoomNotifierFor(int pageNumber) {
+    return _zoomNotifiers.putIfAbsent(
+      pageNumber,
+      () => ValueNotifier<Matrix4>(Matrix4.identity()),
+    );
+  }
+
+  void _evictCaches(int currentPage) {
     final keepFrom = (currentPage - _cbzCacheRadius).clamp(1, _totalPages);
     final keepTo = (currentPage + _cbzCacheRadius).clamp(1, _totalPages);
-    _transformControllers.removeWhere((page, ctrl) {
+
+    _cbzNotifiers.removeWhere((page, notifier) {
       if (page < keepFrom || page > keepTo) {
-        ctrl.dispose();
+        notifier.dispose();
         return true;
       }
       return false;
     });
-    _pageScales.removeWhere((page, _) => page < keepFrom || page > keepTo);
+    _pdfNotifiers.removeWhere((page, notifier) {
+      if (page < keepFrom || page > keepTo) {
+        notifier.dispose();
+        return true;
+      }
+      return false;
+    });
+
+    final zoomKeepFrom = (currentPage - 3).clamp(1, _totalPages);
+    final zoomKeepTo = (currentPage + 3).clamp(1, _totalPages);
+    _zoomNotifiers.removeWhere((page, notifier) {
+      if (page < zoomKeepFrom || page > zoomKeepTo) {
+        notifier.dispose();
+        return true;
+      }
+      return false;
+    });
   }
 
-  // ── Deteksi tepi: apakah konten sudah mentok di sisi tertentu ────────────
-  //
-  // Membandingkan translasi saat ini dengan batas minimum yang diizinkan.
-  // Hasilnya adalah Set sisi yang sedang menyentuh batas viewport.
-  Set<_EdgeSide> _atEdge(TransformationController ctrl) {
-    if (!mounted) return {};
-    final double scale = ctrl.value.getMaxScaleOnAxis();
-    if (scale <= 1.05) return {};
-
-    final Size viewport = MediaQuery.of(context).size;
-    final double tx = ctrl.value.getTranslation().x;
-    final double ty = ctrl.value.getTranslation().y;
-    final double contentW = viewport.width * scale;
-    final double contentH = viewport.height * scale;
-
-    // tx = 0 → tepi kiri konten pas di tepi kiri viewport (mentok kiri)
-    // tx = viewport.width - contentW → mentok kanan
-    final double minTx = viewport.width - contentW;
-    final double minTy = viewport.height - contentH;
-    const double epsilon = 4.0;
-
-    final result = <_EdgeSide>{};
-    if (tx >= -epsilon) result.add(_EdgeSide.left);
-    if (tx <= minTx + epsilon) result.add(_EdgeSide.right);
-    if (ty >= -epsilon) result.add(_EdgeSide.top);
-    if (ty <= minTy + epsilon) result.add(_EdgeSide.bottom);
-    return result;
+  void _resetPageZoom(int pageNumber) {
+    _zoomNotifiers[pageNumber]?.value = Matrix4.identity();
   }
 
   @override
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
-    _zoomAnimController = AnimationController(
-      vsync: this,
-      duration: const Duration(milliseconds: 200),
-    );
     _readingMode = widget.initialReadingMode;
     _isLoading = true;
     _pageController = PageController();
@@ -255,37 +266,28 @@ class _ReaderPageState extends State<ReaderPage>
     });
   }
 
-  // ── PDF lazy rendering ────────────────────────────────────────────────────
+  // ── Prefetch ──────────────────────────────────────────────────────────────
 
   void _preRenderAround(int page) {
-    const int radius = 2;
-    final int first = (page - radius).clamp(1, _totalPages);
-    final int last = (page + radius).clamp(1, _totalPages);
+    final int first = (page - 1).clamp(1, _totalPages);
+    final int last = (page + 3).clamp(1, _totalPages);
     for (int p = first; p <= last; p++) {
       if (_isPdf)
         _ensurePdfPageRendered(p);
       else if (_localPagePaths.isNotEmpty)
         _ensureCbzPageDecoded(p);
     }
-    if (_isPdf) _evictPdfCache(page);
-    if (_localPagePaths.isNotEmpty) _evictCbzCache(page);
-    _evictPageControllers(page);
+    _evictCaches(page);
   }
 
-  // ── PDF cache ─────────────────────────────────────────────────────────────
-
-  void _evictPdfCache(int currentPage) {
-    final int keepFrom = (currentPage - _pdfCacheRadius).clamp(1, _totalPages);
-    final int keepTo = (currentPage + _pdfCacheRadius).clamp(1, _totalPages);
-    _pdfPageCache.removeWhere((page, _) => page < keepFrom || page > keepTo);
-  }
+  // ── PDF rendering ─────────────────────────────────────────────────────────
 
   Future<void> _ensurePdfPageRendered(int pageNumber) async {
     if (_pdfDocument == null) return;
-    if (_pdfPageCache.containsKey(pageNumber)) return;
+    final notifier = _pdfNotifierFor(pageNumber);
+    if (notifier.value != null) return;
     if (_pdfPagesRendering.contains(pageNumber)) return;
 
-    _evictPdfCache(pageNumber);
     _pdfPagesRendering.add(pageNumber);
     try {
       final PdfPage page = await _pdfDocument!.getPage(pageNumber);
@@ -296,11 +298,7 @@ class _ReaderPageState extends State<ReaderPage>
         backgroundColor: '#FFFFFF',
       );
       await page.close();
-
-      if (image != null && mounted) {
-        _pdfPageCache[pageNumber] = image.bytes;
-        if (!_isSwiping) setState(() {});
-      }
+      if (image != null && mounted) notifier.value = image.bytes;
     } catch (e) {
       debugPrint('PDF render error (page $pageNumber): $e');
     } finally {
@@ -308,31 +306,21 @@ class _ReaderPageState extends State<ReaderPage>
     }
   }
 
-  // ── CBZ / CBR cache ───────────────────────────────────────────────────────
-
-  void _evictCbzCache(int currentPage) {
-    final int keepFrom = (currentPage - _cbzCacheRadius).clamp(1, _totalPages);
-    final int keepTo = (currentPage + _cbzCacheRadius).clamp(1, _totalPages);
-    _cbzPageCache.removeWhere((page, _) => page < keepFrom || page > keepTo);
-  }
+  // ── CBZ / CBR decoding ────────────────────────────────────────────────────
 
   Future<void> _ensureCbzPageDecoded(int pageNumber) async {
     if (_localPagePaths.isEmpty) return;
-    if (_cbzPageCache.containsKey(pageNumber)) return;
+    final notifier = _cbzNotifierFor(pageNumber);
+    if (notifier.value != null) return;
     if (_cbzPagesDecoding.contains(pageNumber)) return;
 
-    _evictCbzCache(pageNumber);
     _cbzPagesDecoding.add(pageNumber);
-
     try {
       final Uint8List bytes = await ComicService.getPageBytes(
         widget.comic.localPath!,
         _localPagePaths[pageNumber - 1],
       );
-      if (mounted) {
-        _cbzPageCache[pageNumber] = bytes;
-        if (!_isSwiping) setState(() {});
-      }
+      if (mounted) notifier.value = bytes;
     } catch (e) {
       debugPrint('CBZ decode error (page $pageNumber): $e');
     } finally {
@@ -350,12 +338,10 @@ class _ReaderPageState extends State<ReaderPage>
     setState(() {
       _currentPage = page;
       _sliderDragValue = null;
-      _isSwiping = false;
-      _pannedEdge = _EdgeSide.none;
-      _edgeOverscrollAccum = 0.0;
     });
 
     _resetPageZoom(page);
+    _pageScrollLocked.value = false;
     _preRenderAround(page);
     _saveProgress(page);
   }
@@ -373,38 +359,33 @@ class _ReaderPageState extends State<ReaderPage>
   void _navigateNext() {
     _resetPageZoom(_currentPage);
     _pageController.nextPage(
-      duration: const Duration(milliseconds: 180),
-      curve: Curves.easeOut,
+      duration: const Duration(milliseconds: 200),
+      curve: Curves.easeOutCubic,
     );
   }
 
   void _navigatePrev() {
     _resetPageZoom(_currentPage);
     _pageController.previousPage(
-      duration: const Duration(milliseconds: 180),
-      curve: Curves.easeOut,
+      duration: const Duration(milliseconds: 200),
+      curve: Curves.easeOutCubic,
     );
   }
 
   // ── Tap navigation ────────────────────────────────────────────────────────
 
   void _handleTapNavigation(Offset localPosition) {
-    if (_isZoomed) {
-      // Saat zoom aktif, tap hanya untuk toggle UI di zona tengah.
-      // Navigasi antar halaman dilakukan lewat edge-pan.
-      final double screenWidth = MediaQuery.of(context).size.width;
-      final double zoneWidth = screenWidth * 0.25;
+    if (_isPageZoomed(_currentPage)) {
+      final double sw = MediaQuery.of(context).size.width;
       final bool tapCenter =
-          localPosition.dx >= zoneWidth &&
-          localPosition.dx <= screenWidth - zoneWidth;
+          localPosition.dx >= sw * 0.25 && localPosition.dx <= sw * 0.75;
       if (tapCenter) setState(() => _showUI = !_showUI);
       return;
     }
 
-    final double screenWidth = MediaQuery.of(context).size.width;
-    final double zoneWidth = screenWidth * 0.25;
-    final bool tapLeft = localPosition.dx < zoneWidth;
-    final bool tapRight = localPosition.dx > screenWidth - zoneWidth;
+    final double sw = MediaQuery.of(context).size.width;
+    final bool tapLeft = localPosition.dx < sw * 0.25;
+    final bool tapRight = localPosition.dx > sw * 0.75;
 
     if (!tapLeft && !tapRight) {
       setState(() => _showUI = !_showUI);
@@ -418,137 +399,15 @@ class _ReaderPageState extends State<ReaderPage>
       if (_currentPage < _totalPages) {
         _showTapFlash(isRight: true);
         _navigateNext();
-      } else {
+      } else
         HapticFeedback.lightImpact();
-      }
     } else if (goPrev) {
       if (_currentPage > 1) {
         _showTapFlash(isRight: false);
         _navigatePrev();
-      } else {
+      } else
         HapticFeedback.lightImpact();
-      }
     }
-  }
-
-  // ── ZOOM-AWARE NAVIGATION: edge-pan handlers ──────────────────────────────
-
-  void _onInteractionStart(
-    ScaleStartDetails details,
-    TransformationController ctrl,
-  ) {
-    _panStartFocalPoint = details.focalPoint;
-    _pannedEdge = _EdgeSide.none;
-    _edgeOverscrollAccum = 0.0;
-  }
-
-  void _onInteractionUpdate(
-    ScaleUpdateDetails details,
-    TransformationController ctrl,
-    int pageNumber,
-  ) {
-    // Update skala untuk throttle setState
-    final scale = ctrl.value.getMaxScaleOnAxis();
-    final prev = _pageScales[pageNumber] ?? 1.0;
-    if ((prev - scale).abs() > 0.02) {
-      setState(() => _pageScales[pageNumber] = scale);
-    }
-
-    // Edge-pan hanya berlaku saat zoom aktif dan gesture satu jari
-    if (!_isZoomed || details.pointerCount != 1) {
-      if (details.pointerCount > 1) {
-        // Pinch gesture — reset akumulasi
-        _pannedEdge = _EdgeSide.none;
-        _edgeOverscrollAccum = 0.0;
-      }
-      return;
-    }
-
-    final Set<_EdgeSide> edges = _atEdge(ctrl);
-    final Offset delta = details.focalPointDelta;
-    final bool isHorizontal = _readingMode != ReadingMode.vertical;
-
-    if (isHorizontal) {
-      // Delta negatif (geser kiri) + konten mentok di kanan → ingin next
-      // Delta positif (geser kanan) + konten mentok di kiri → ingin prev
-      if (delta.dx < 0 && edges.contains(_EdgeSide.right)) {
-        if (_pannedEdge != _EdgeSide.right) {
-          _pannedEdge = _EdgeSide.right;
-          _edgeOverscrollAccum = 0.0;
-        }
-        _edgeOverscrollAccum += delta.dx.abs();
-      } else if (delta.dx > 0 && edges.contains(_EdgeSide.left)) {
-        if (_pannedEdge != _EdgeSide.left) {
-          _pannedEdge = _EdgeSide.left;
-          _edgeOverscrollAccum = 0.0;
-        }
-        _edgeOverscrollAccum += delta.dx.abs();
-      } else {
-        _pannedEdge = _EdgeSide.none;
-        _edgeOverscrollAccum = 0.0;
-      }
-    } else {
-      if (delta.dy < 0 && edges.contains(_EdgeSide.bottom)) {
-        if (_pannedEdge != _EdgeSide.bottom) {
-          _pannedEdge = _EdgeSide.bottom;
-          _edgeOverscrollAccum = 0.0;
-        }
-        _edgeOverscrollAccum += delta.dy.abs();
-      } else if (delta.dy > 0 && edges.contains(_EdgeSide.top)) {
-        if (_pannedEdge != _EdgeSide.top) {
-          _pannedEdge = _EdgeSide.top;
-          _edgeOverscrollAccum = 0.0;
-        }
-        _edgeOverscrollAccum += delta.dy.abs();
-      } else {
-        _pannedEdge = _EdgeSide.none;
-        _edgeOverscrollAccum = 0.0;
-      }
-    }
-  }
-
-  void _onInteractionEnd(ScaleEndDetails details, int pageNumber) {
-    final scale =
-        _transformControllers[pageNumber]?.value.getMaxScaleOnAxis() ?? 1.0;
-    if (scale <= 1.05) setState(() => _pageScales[pageNumber] = 1.0);
-
-    // Eksekusi navigasi jika akumulasi overscroll cukup
-    if (_isZoomed && _edgeOverscrollAccum >= _edgeNavThreshold) {
-      final bool isHorizontal = _readingMode != ReadingMode.vertical;
-
-      if (isHorizontal) {
-        // Tepi kanan mentok + dorong kiri = maju (kecuali manga: mundur)
-        final bool wantsNext = _pannedEdge == _EdgeSide.right;
-        final bool wantsPrev = _pannedEdge == _EdgeSide.left;
-        final bool goNext = _isManga ? wantsPrev : wantsNext;
-        final bool goPrev = _isManga ? wantsNext : wantsPrev;
-
-        if (goNext && _currentPage < _totalPages) {
-          HapticFeedback.lightImpact();
-          _navigateNext();
-        } else if (goPrev && _currentPage > 1) {
-          HapticFeedback.lightImpact();
-          _navigatePrev();
-        } else {
-          // Boundary — beri feedback tanpa pindah
-          HapticFeedback.lightImpact();
-        }
-      } else {
-        if (_pannedEdge == _EdgeSide.bottom && _currentPage < _totalPages) {
-          HapticFeedback.lightImpact();
-          _navigateNext();
-        } else if (_pannedEdge == _EdgeSide.top && _currentPage > 1) {
-          HapticFeedback.lightImpact();
-          _navigatePrev();
-        } else {
-          HapticFeedback.lightImpact();
-        }
-      }
-    }
-
-    _pannedEdge = _EdgeSide.none;
-    _edgeOverscrollAccum = 0.0;
-    _panStartFocalPoint = null;
   }
 
   void _showTapFlash({required bool isRight}) {
@@ -565,9 +424,9 @@ class _ReaderPageState extends State<ReaderPage>
     final raw = prefs.getString('bookmarks_${widget.comic.id}');
     if (raw != null && mounted) {
       final List decoded = jsonDecode(raw);
-      setState(() {
-        _bookmarks = decoded.map((e) => Bookmark.fromJson(e)).toList();
-      });
+      setState(
+        () => _bookmarks = decoded.map((e) => Bookmark.fromJson(e)).toList(),
+      );
     }
   }
 
@@ -583,7 +442,6 @@ class _ReaderPageState extends State<ReaderPage>
 
   Future<void> _saveCurrentPageToGallery() async {
     final bool useDual = _dualPageMode && _readingMode != ReadingMode.vertical;
-
     try {
       final hasAccess = await Gal.hasAccess();
       if (!hasAccess) await Gal.requestAccess();
@@ -591,20 +449,18 @@ class _ReaderPageState extends State<ReaderPage>
       if (useDual) {
         final int leftPage = _isManga ? _currentPage + 1 : _currentPage;
         final int rightPage = _isManga ? _currentPage : _currentPage + 1;
-
-        final Uint8List? leftBytes = _getPageBytes(leftPage);
-        final Uint8List? rightBytes = _getPageBytes(rightPage);
-
-        if (leftBytes == null && rightBytes == null) {
+        final Uint8List? lb = _getPageBytes(leftPage);
+        final Uint8List? rb = _getPageBytes(rightPage);
+        if (lb == null && rb == null) {
           _showSnackBar('Halaman belum selesai dimuat', isError: true);
           return;
         }
-
-        final Uint8List merged = await _mergePages(leftBytes, rightBytes);
-        final fileName =
-            '${widget.comic.title}_hal${leftPage}-${rightPage}_'
-            '${DateTime.now().millisecondsSinceEpoch}.jpg';
-        await Gal.putImageBytes(merged, name: fileName);
+        final merged = await _mergePages(lb, rb);
+        await Gal.putImageBytes(
+          merged,
+          name:
+              '${widget.comic.title}_hal${leftPage}-${rightPage}_${DateTime.now().millisecondsSinceEpoch}.jpg',
+        );
         _showSnackBar('Halaman $leftPage–$rightPage disimpan ke galeri');
       } else {
         final Uint8List? bytes = _getPageBytes(_currentPage);
@@ -612,10 +468,11 @@ class _ReaderPageState extends State<ReaderPage>
           _showSnackBar('Halaman belum selesai dimuat', isError: true);
           return;
         }
-        final fileName =
-            '${widget.comic.title}_hal${_currentPage}_'
-            '${DateTime.now().millisecondsSinceEpoch}.jpg';
-        await Gal.putImageBytes(bytes, name: fileName);
+        await Gal.putImageBytes(
+          bytes,
+          name:
+              '${widget.comic.title}_hal${_currentPage}_${DateTime.now().millisecondsSinceEpoch}.jpg',
+        );
         _showSnackBar('Halaman $_currentPage disimpan ke galeri');
       }
     } catch (e) {
@@ -625,8 +482,8 @@ class _ReaderPageState extends State<ReaderPage>
   }
 
   Uint8List? _getPageBytes(int pageNumber) {
-    if (_isPdf) return _pdfPageCache[pageNumber];
-    if (_localPagePaths.isNotEmpty) return _cbzPageCache[pageNumber];
+    if (_isPdf) return _pdfNotifiers[pageNumber]?.value;
+    if (_localPagePaths.isNotEmpty) return _cbzNotifiers[pageNumber]?.value;
     return null;
   }
 
@@ -634,24 +491,19 @@ class _ReaderPageState extends State<ReaderPage>
     Uint8List? leftBytes,
     Uint8List? rightBytes,
   ) async {
-    final ui.Image? leftImg = await _decodeImage(leftBytes);
-    final ui.Image? rightImg = await _decodeImage(rightBytes);
-
-    final int w = (leftImg?.width ?? rightImg?.width ?? 800);
-    final int h = (leftImg?.height ?? rightImg?.height ?? 1200);
-
+    final ui.Image? li = await _decodeImage(leftBytes);
+    final ui.Image? ri = await _decodeImage(rightBytes);
+    final int w = (li?.width ?? ri?.width ?? 800);
+    final int h = (li?.height ?? ri?.height ?? 1200);
     final recorder = ui.PictureRecorder();
     final canvas = ui.Canvas(recorder);
-
     canvas.drawRect(
       ui.Rect.fromLTWH(0, 0, (w * 2).toDouble(), h.toDouble()),
       ui.Paint()..color = const Color(0xFF000000),
     );
-
-    if (leftImg != null) canvas.drawImage(leftImg, ui.Offset.zero, ui.Paint());
-    if (rightImg != null)
-      canvas.drawImage(rightImg, ui.Offset(w.toDouble(), 0), ui.Paint());
-
+    if (li != null) canvas.drawImage(li, ui.Offset.zero, ui.Paint());
+    if (ri != null)
+      canvas.drawImage(ri, ui.Offset(w.toDouble(), 0), ui.Paint());
     final picture = recorder.endRecording();
     final img = await picture.toImage(w * 2, h);
     final byteData = await img.toByteData(format: ui.ImageByteFormat.png);
@@ -830,7 +682,6 @@ class _ReaderPageState extends State<ReaderPage>
         _lastSaved != null &&
         now.difference(_lastSaved!).inSeconds < 2)
       return;
-
     _lastSaved = now;
     final double progress = _totalPages > 0 ? (page / _totalPages) : 0.0;
     ComicService.updateComicProgress(
@@ -855,18 +706,16 @@ class _ReaderPageState extends State<ReaderPage>
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
     _saveProgress(_currentPage, force: true);
-
     SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
-
-    if (widget.comic.localPath != null) {
+    if (widget.comic.localPath != null)
       ComicService.closeArchive(widget.comic.localPath!);
-    }
-
-    for (final ctrl in _transformControllers.values) ctrl.dispose();
-    _transformControllers.clear();
-
-    _zoomAnimController?.dispose();
-
+    for (final n in _cbzNotifiers.values) n.dispose();
+    for (final n in _pdfNotifiers.values) n.dispose();
+    for (final n in _zoomNotifiers.values) n.dispose();
+    _pageScrollLocked.dispose();
+    _cbzNotifiers.clear();
+    _pdfNotifiers.clear();
+    _zoomNotifiers.clear();
     ReadingHistoryService.saveEntry(
       ReadingHistoryEntry(
         id: widget.comic.id,
@@ -878,7 +727,6 @@ class _ReaderPageState extends State<ReaderPage>
         lastRead: DateTime.now().millisecondsSinceEpoch,
       ),
     );
-
     _pageController.dispose();
     _pdfDocument?.close();
     super.dispose();
@@ -914,13 +762,13 @@ class _ReaderPageState extends State<ReaderPage>
   }
 
   Widget _buildTapZoneFlash(bool isRight) {
-    final screenWidth = MediaQuery.of(context).size.width;
-    final zoneWidth = screenWidth * 0.25;
+    final sw = MediaQuery.of(context).size.width;
+    final zw = sw * 0.25;
     return Positioned(
       top: 0,
       bottom: 0,
-      left: isRight ? screenWidth - zoneWidth : 0,
-      width: zoneWidth,
+      left: isRight ? sw - zw : 0,
+      width: zw,
       child: IgnorePointer(
         child: AnimatedOpacity(
           opacity: _tapFlashRight != null ? 1.0 : 0.0,
@@ -944,7 +792,6 @@ class _ReaderPageState extends State<ReaderPage>
 
   Widget _buildReaderContent() {
     final Color primaryColor = Theme.of(context).primaryColor;
-
     return Container(
       color: Colors.black,
       width: double.infinity,
@@ -998,58 +845,88 @@ class _ReaderPageState extends State<ReaderPage>
     );
   }
 
+  // FIX #2: PageView membaca physics dari ValueListenableBuilder sehingga
+  // perubahan lock/unlock terjadi secara sinkron tanpa menunggu setState parent.
   Widget _buildMainContent(Color primaryColor) {
     final bool useDual = _dualPageMode && _readingMode != ReadingMode.vertical;
     final int itemCount = useDual ? ((_totalPages + 1) ~/ 2) : _totalPages;
 
-    return NotificationListener<ScrollNotification>(
-      onNotification: (notification) {
-        if (notification is ScrollStartNotification) {
-          _isSwiping = true;
-        } else if (notification is ScrollEndNotification) {
-          if (_isSwiping) _isSwiping = false;
-        }
-        return false;
-      },
-      child: PageView.builder(
-        scrollDirection:
-            _readingMode == ReadingMode.vertical
-                ? Axis.vertical
-                : Axis.horizontal,
-        reverse: _isManga,
-        controller: _pageController,
-        // PageView tetap diblokir saat zoom — navigasi via edge-pan
-        physics:
-            _isZoomed
-                ? const NeverScrollableScrollPhysics()
-                : const ClampingScrollPhysics(),
-        onPageChanged: _onPageChanged,
-        itemCount: itemCount,
-        itemBuilder: (context, slotIndex) {
-          if (!useDual) return _buildZoomablePage(slotIndex + 1, primaryColor);
+    return ValueListenableBuilder<bool>(
+      valueListenable: _pageScrollLocked,
+      builder: (context, locked, _) {
+        return PageView.builder(
+          scrollDirection:
+              _readingMode == ReadingMode.vertical
+                  ? Axis.vertical
+                  : Axis.horizontal,
+          reverse: _isManga,
+          controller: _pageController,
+          // Physics dikontrol oleh _pageScrollLocked, bukan setState parent
+          physics:
+              locked
+                  ? const NeverScrollableScrollPhysics()
+                  : const ClampingScrollPhysics(),
+          onPageChanged: _onPageChanged,
+          itemCount: itemCount,
+          itemBuilder: (context, slotIndex) {
+            if (!useDual) {
+              final int pageNumber = slotIndex + 1;
+              return _ZoomPage(
+                key: ValueKey('page_$pageNumber'),
+                pageNumber: pageNumber,
+                zoomNotifier: _zoomNotifierFor(pageNumber),
+                pageScrollLocked: _pageScrollLocked,
+                isManga: _isManga,
+                isVertical: _readingMode == ReadingMode.vertical,
+                totalPages: _totalPages,
+                onTap: _handleTapNavigation,
+                onNavigateNext:
+                    pageNumber < _totalPages
+                        ? () {
+                          HapticFeedback.lightImpact();
+                          _navigateNext();
+                        }
+                        : null,
+                onNavigatePrev:
+                    pageNumber > 1
+                        ? () {
+                          HapticFeedback.lightImpact();
+                          _navigatePrev();
+                        }
+                        : null,
+                child: _buildPageContent(slotIndex, primaryColor),
+              );
+            }
 
-          final int leftPage = _isManga ? slotIndex * 2 + 2 : slotIndex * 2 + 1;
-          final int rightPage =
-              _isManga ? slotIndex * 2 + 1 : slotIndex * 2 + 2;
-          final int primaryPage = slotIndex * 2 + 1;
-          final ctrl = _controllerForPage(primaryPage);
+            final int primaryPage = slotIndex * 2 + 1;
+            final int leftPage =
+                _isManga ? slotIndex * 2 + 2 : slotIndex * 2 + 1;
+            final int rightPage =
+                _isManga ? slotIndex * 2 + 1 : slotIndex * 2 + 2;
 
-          return GestureDetector(
-            onTapUp: (details) => _handleTapNavigation(details.localPosition),
-            onDoubleTapDown:
-                (details) => _handleDoubleTap(details, primaryPage),
-            onDoubleTap: () {},
-            child: InteractiveViewer(
-              transformationController: ctrl,
-              minScale: 1.0,
-              maxScale: 5.0,
-              boundaryMargin: const EdgeInsets.all(20),
-              onInteractionStart:
-                  (details) => _onInteractionStart(details, ctrl),
-              onInteractionUpdate:
-                  (details) => _onInteractionUpdate(details, ctrl, primaryPage),
-              onInteractionEnd:
-                  (details) => _onInteractionEnd(details, primaryPage),
+            return _ZoomPage(
+              key: ValueKey('dual_$primaryPage'),
+              pageNumber: primaryPage,
+              zoomNotifier: _zoomNotifierFor(primaryPage),
+              pageScrollLocked: _pageScrollLocked,
+              isManga: _isManga,
+              isVertical: false,
+              totalPages: _totalPages,
+              onTap: _handleTapNavigation,
+              onNavigateNext:
+                  primaryPage < _totalPages
+                      ? () {
+                        HapticFeedback.lightImpact();
+                        _navigateNext();
+                      }
+                      : null,
+              onNavigatePrev:
+                  primaryPage > 1
+                      ? () {
+                        HapticFeedback.lightImpact();
+                        _navigatePrev();
+                      }
+                      : null,
               child: Row(
                 children: [
                   Expanded(
@@ -1066,82 +943,10 @@ class _ReaderPageState extends State<ReaderPage>
                   ),
                 ],
               ),
-            ),
-          );
-        },
-      ),
-    );
-  }
-
-  // ── Double-tap zoom ───────────────────────────────────────────────────────
-
-  void _handleDoubleTap(TapDownDetails details, int pageNumber) {
-    final ctrl = _controllerForPage(pageNumber);
-    final double currentScale = _pageScales[pageNumber] ?? 1.0;
-    final bool isZoomedIn = currentScale > 1.05;
-
-    if (isZoomedIn) {
-      _animateZoom(Matrix4.identity(), ctrl, pageNumber, targetScale: 1.0);
-      return;
-    }
-
-    final Offset tap = details.localPosition;
-    final double x = -tap.dx * (_doubleTapZoomScale - 1);
-    final double y = -tap.dy * (_doubleTapZoomScale - 1);
-    final Matrix4 zoomed =
-        Matrix4.identity()
-          ..translate(x, y)
-          ..scale(_doubleTapZoomScale);
-
-    _animateZoom(zoomed, ctrl, pageNumber, targetScale: _doubleTapZoomScale);
-  }
-
-  void _animateZoom(
-    Matrix4 target,
-    TransformationController ctrl,
-    int pageNumber, {
-    required double targetScale,
-  }) {
-    _zoomAnimController!.stop();
-    _activeAnimTarget = ctrl;
-    _zoomAnimation = Matrix4Tween(begin: ctrl.value, end: target).animate(
-      CurvedAnimation(parent: _zoomAnimController!, curve: Curves.easeInOut),
-    )..addListener(() {
-      if (_activeAnimTarget == ctrl) {
-        ctrl.value = _zoomAnimation!.value;
-        final scale = ctrl.value.getMaxScaleOnAxis();
-        if ((_pageScales[pageNumber] ?? 1.0 - scale).abs() > 0.01) {
-          setState(() => _pageScales[pageNumber] = scale);
-        }
-      }
-    });
-    _zoomAnimController!
-      ..reset()
-      ..forward().then((_) {
-        if (mounted) setState(() => _pageScales[pageNumber] = targetScale);
-      });
-  }
-
-  // ── Zoomable page (single-page mode) ─────────────────────────────────────
-
-  Widget _buildZoomablePage(int pageNumber, Color primaryColor) {
-    final ctrl = _controllerForPage(pageNumber);
-
-    return GestureDetector(
-      onTapUp: (details) => _handleTapNavigation(details.localPosition),
-      onDoubleTapDown: (details) => _handleDoubleTap(details, pageNumber),
-      onDoubleTap: () {},
-      child: InteractiveViewer(
-        transformationController: ctrl,
-        minScale: 1.0,
-        maxScale: 5.0,
-        boundaryMargin: const EdgeInsets.all(20),
-        onInteractionStart: (details) => _onInteractionStart(details, ctrl),
-        onInteractionUpdate:
-            (details) => _onInteractionUpdate(details, ctrl, pageNumber),
-        onInteractionEnd: (details) => _onInteractionEnd(details, pageNumber),
-        child: _buildPageContent(pageNumber - 1, primaryColor),
-      ),
+            );
+          },
+        );
+      },
     );
   }
 
@@ -1149,39 +954,49 @@ class _ReaderPageState extends State<ReaderPage>
     final int pageNumber = index + 1;
 
     if (_isPdf) {
-      final Uint8List? cached = _pdfPageCache[pageNumber];
-      if (cached != null) {
-        return Center(
-          child: Image.memory(
-            cached,
-            fit: BoxFit.contain,
-            filterQuality: FilterQuality.medium,
-            gaplessPlayback: true,
-          ),
-        );
-      }
+      final notifier = _pdfNotifierFor(pageNumber);
       _ensurePdfPageRendered(pageNumber);
-      return Center(child: CircularProgressIndicator(color: primaryColor));
+      return ValueListenableBuilder<Uint8List?>(
+        valueListenable: notifier,
+        builder: (context, bytes, _) {
+          if (bytes != null) {
+            return Center(
+              child: Image.memory(
+                bytes,
+                fit: BoxFit.contain,
+                filterQuality: FilterQuality.medium,
+                gaplessPlayback: true,
+              ),
+            );
+          }
+          return Center(child: CircularProgressIndicator(color: primaryColor));
+        },
+      );
     }
 
     if (_localPagePaths.isNotEmpty) {
-      final Uint8List? cached = _cbzPageCache[pageNumber];
-      if (cached != null) {
-        return Center(
-          child: Image.memory(
-            cached,
-            fit: BoxFit.contain,
-            filterQuality: FilterQuality.medium,
-            gaplessPlayback: true,
-            errorBuilder:
-                (context, error, stackTrace) => const Center(
-                  child: Icon(Icons.broken_image, color: Colors.white24),
-                ),
-          ),
-        );
-      }
+      final notifier = _cbzNotifierFor(pageNumber);
       _ensureCbzPageDecoded(pageNumber);
-      return Center(child: CircularProgressIndicator(color: primaryColor));
+      return ValueListenableBuilder<Uint8List?>(
+        valueListenable: notifier,
+        builder: (context, bytes, _) {
+          if (bytes != null) {
+            return Center(
+              child: Image.memory(
+                bytes,
+                fit: BoxFit.contain,
+                filterQuality: FilterQuality.medium,
+                gaplessPlayback: true,
+                errorBuilder:
+                    (context, error, stackTrace) => const Center(
+                      child: Icon(Icons.broken_image, color: Colors.white24),
+                    ),
+              ),
+            );
+          }
+          return Center(child: CircularProgressIndicator(color: primaryColor));
+        },
+      );
     }
 
     if (widget.comic.pages.isNotEmpty && index < widget.comic.pages.length) {
@@ -1367,7 +1182,6 @@ class _ReaderPageState extends State<ReaderPage>
       1.0,
       total.toDouble(),
     );
-
     return SliderTheme(
       data: SliderTheme.of(context).copyWith(
         trackHeight: 2,
@@ -1646,6 +1460,338 @@ class _ReaderPageState extends State<ReaderPage>
             trailing,
           ],
         ),
+      ),
+    );
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// _ZoomPage — widget per-halaman dengan zoom & pan smooth
+//
+// FIX #1: RawGestureDetector + _AllowMultipleScaleRecognizer menggantikan
+//         GestureDetector biasa agar pinch tidak dicuri PageView.
+// FIX #2: pageScrollLocked (ValueNotifier<bool>) dikontrol di sini sehingga
+//         PageView physics berubah sinkron sebelum gesture diteruskan.
+// FIX #3: onZoomChanged dipanggil di completion callback _animateTo agar
+//         PageView tidak dibuka kunci sebelum animasi zoom-out selesai.
+// ═══════════════════════════════════════════════════════════════════════════
+
+class _ZoomPage extends StatefulWidget {
+  final int pageNumber;
+  final ValueNotifier<Matrix4> zoomNotifier;
+  final ValueNotifier<bool> pageScrollLocked;
+  final bool isManga;
+  final bool isVertical;
+  final int totalPages;
+  final void Function(Offset localPosition) onTap;
+  final VoidCallback? onNavigateNext;
+  final VoidCallback? onNavigatePrev;
+  final Widget child;
+
+  static const double minScale = 1.0;
+  static const double maxScale = 5.0;
+  static const double doubleTapScale = 2.5;
+
+  const _ZoomPage({
+    super.key,
+    required this.pageNumber,
+    required this.zoomNotifier,
+    required this.pageScrollLocked,
+    required this.isManga,
+    required this.isVertical,
+    required this.totalPages,
+    required this.onTap,
+    required this.onNavigateNext,
+    required this.onNavigatePrev,
+    required this.child,
+  });
+
+  @override
+  State<_ZoomPage> createState() => _ZoomPageState();
+}
+
+class _ZoomPageState extends State<_ZoomPage>
+    with SingleTickerProviderStateMixin {
+  // State gesture
+  Offset _startFocalPoint = Offset.zero;
+  double _startScale = 1.0;
+  Matrix4 _startMatrix = Matrix4.identity();
+
+  // Akumulasi overscroll untuk navigasi halaman via edge-pan
+  double _edgeAccum = 0.0;
+  static const double _edgeThreshold = 55.0;
+
+  // Animasi double-tap zoom
+  late AnimationController _animController;
+  Animation<Matrix4>? _anim;
+
+  bool get _isZoomed => widget.zoomNotifier.value.getMaxScaleOnAxis() > 1.05;
+
+  @override
+  void initState() {
+    super.initState();
+    _animController = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 220),
+    );
+  }
+
+  @override
+  void dispose() {
+    _animController.dispose();
+    super.dispose();
+  }
+
+  // ── Matrix helpers ────────────────────────────────────────────────────────
+
+  /// Clamp translasi agar gambar tidak keluar batas viewport.
+  Matrix4 _clamped(Matrix4 m, Size vp) {
+    final double s = m.getMaxScaleOnAxis();
+    final double tx = m.getTranslation().x;
+    final double ty = m.getTranslation().y;
+    final double minTx = math.min(0.0, vp.width * (1 - s));
+    final double minTy = math.min(0.0, vp.height * (1 - s));
+    return Matrix4.identity()
+      ..translate(tx.clamp(minTx, 0.0), ty.clamp(minTy, 0.0))
+      ..scale(s);
+  }
+
+  /// Sisi viewport yang sedang disentuh konten.
+  Set<String> _edges(Size vp) {
+    final m = widget.zoomNotifier.value;
+    final double s = m.getMaxScaleOnAxis();
+    if (s <= 1.05) return {};
+    final double tx = m.getTranslation().x;
+    final double ty = m.getTranslation().y;
+    final double minTx = vp.width * (1 - s);
+    final double minTy = vp.height * (1 - s);
+    const double eps = 4.0;
+    return {
+      if (tx >= -eps) 'left',
+      if (tx <= minTx + eps) 'right',
+      if (ty >= -eps) 'top',
+      if (ty <= minTy + eps) 'bottom',
+    };
+  }
+
+  // ── Gesture handlers ──────────────────────────────────────────────────────
+
+  void _onScaleStart(ScaleStartDetails d) {
+    _animController.stop();
+    _startFocalPoint = d.focalPoint;
+    _startMatrix = Matrix4.copy(widget.zoomNotifier.value);
+    _startScale = _startMatrix.getMaxScaleOnAxis();
+    _edgeAccum = 0.0;
+
+    // FIX #2: Kunci PageView segera saat gesture dimulai (jika sudah zoom
+    // atau pinch dengan 2 jari) agar drag tidak bocor ke PageView.
+    if (_isZoomed || d.pointerCount >= 2) {
+      widget.pageScrollLocked.value = true;
+    }
+  }
+
+  void _onScaleUpdate(ScaleUpdateDetails d) {
+    final Size vp = MediaQuery.of(context).size;
+
+    if (d.pointerCount >= 2) {
+      // FIX #1 + #2: Pastikan kunci aktif saat pinch berlangsung
+      widget.pageScrollLocked.value = true;
+
+      // ── Pinch: scale dari titik focal ────────────────────────────────────
+      final double newScale = (_startScale * d.scale).clamp(
+        _ZoomPage.minScale,
+        _ZoomPage.maxScale,
+      );
+      final double startTx = _startMatrix.getTranslation().x;
+      final double startTy = _startMatrix.getTranslation().y;
+      final double tx =
+          d.focalPoint.dx -
+          (_startFocalPoint.dx - startTx) * (newScale / _startScale);
+      final double ty =
+          d.focalPoint.dy -
+          (_startFocalPoint.dy - startTy) * (newScale / _startScale);
+      widget.zoomNotifier.value = _clamped(
+        Matrix4.identity()
+          ..translate(tx, ty)
+          ..scale(newScale),
+        vp,
+      );
+      _edgeAccum = 0.0;
+    } else if (_isZoomed) {
+      // ── Single-finger pan (hanya aktif saat zoom > 1) ────────────────────
+      widget.pageScrollLocked.value = true;
+
+      final double s = widget.zoomNotifier.value.getMaxScaleOnAxis();
+      final double curTx = widget.zoomNotifier.value.getTranslation().x;
+      final double curTy = widget.zoomNotifier.value.getTranslation().y;
+      widget.zoomNotifier.value = _clamped(
+        Matrix4.identity()
+          ..translate(
+            curTx + d.focalPointDelta.dx,
+            curTy + d.focalPointDelta.dy,
+          )
+          ..scale(s),
+        vp,
+      );
+
+      // Akumulasi edge-pan untuk navigasi halaman
+      final edges = _edges(vp);
+      final double dx = d.focalPointDelta.dx;
+      final double dy = d.focalPointDelta.dy;
+      if (!widget.isVertical) {
+        if ((dx < 0 && edges.contains('right')) ||
+            (dx > 0 && edges.contains('left'))) {
+          _edgeAccum += dx.abs();
+        } else {
+          _edgeAccum = 0.0;
+        }
+      } else {
+        if ((dy < 0 && edges.contains('bottom')) ||
+            (dy > 0 && edges.contains('top'))) {
+          _edgeAccum += dy.abs();
+        } else {
+          _edgeAccum = 0.0;
+        }
+      }
+    }
+  }
+
+  void _onScaleEnd(ScaleEndDetails d) {
+    final Size vp = MediaQuery.of(context).size;
+
+    // Snap balik ke 1.0 kalau scale di bawah minimum
+    if (widget.zoomNotifier.value.getMaxScaleOnAxis() < _ZoomPage.minScale) {
+      // FIX #3: Buka kunci setelah animasi snap-back selesai
+      _animateTo(
+        Matrix4.identity(),
+        onComplete: () {
+          widget.pageScrollLocked.value = false;
+        },
+      );
+      return;
+    }
+
+    // Eksekusi navigasi via edge-pan
+    if (_isZoomed && _edgeAccum >= _edgeThreshold) {
+      final edges = _edges(vp);
+      if (!widget.isVertical) {
+        final bool wantsNext = edges.contains('right');
+        final bool wantsPrev = edges.contains('left');
+        final bool goNext = widget.isManga ? wantsPrev : wantsNext;
+        final bool goPrev = widget.isManga ? wantsNext : wantsPrev;
+        if (goNext)
+          widget.onNavigateNext?.call();
+        else if (goPrev)
+          widget.onNavigatePrev?.call();
+        else
+          HapticFeedback.lightImpact();
+      } else {
+        if (edges.contains('bottom'))
+          widget.onNavigateNext?.call();
+        else if (edges.contains('top'))
+          widget.onNavigatePrev?.call();
+        else
+          HapticFeedback.lightImpact();
+      }
+    }
+    _edgeAccum = 0.0;
+
+    // FIX #2: Buka kunci PageView jika tidak sedang zoom
+    if (!_isZoomed) {
+      widget.pageScrollLocked.value = false;
+    }
+  }
+
+  void _onDoubleTapDown(TapDownDetails d) {
+    final Size vp = MediaQuery.of(context).size;
+    if (_isZoomed) {
+      // FIX #3: Buka kunci PageView hanya setelah animasi zoom-out selesai
+      _animateTo(
+        Matrix4.identity(),
+        onComplete: () {
+          widget.pageScrollLocked.value = false;
+        },
+      );
+    } else {
+      const double s = _ZoomPage.doubleTapScale;
+      final double tx = (vp.width / 2) - d.localPosition.dx * s;
+      final double ty = (vp.height / 2) - d.localPosition.dy * s;
+      widget.pageScrollLocked.value = true;
+      _animateTo(
+        _clamped(
+          Matrix4.identity()
+            ..translate(tx, ty)
+            ..scale(s),
+          vp,
+        ),
+      );
+    }
+  }
+
+  // FIX #3: _animateTo kini menerima onComplete callback opsional.
+  void _animateTo(Matrix4 target, {VoidCallback? onComplete}) {
+    final Matrix4 from = Matrix4.copy(widget.zoomNotifier.value);
+    _animController.stop();
+    _anim = Matrix4Tween(begin: from, end: target).animate(
+      CurvedAnimation(parent: _animController, curve: Curves.easeOutCubic),
+    )..addListener(() {
+      if (mounted) widget.zoomNotifier.value = _anim!.value;
+    });
+
+    // Panggil onComplete tepat saat animasi selesai, bukan sebelumnya
+    if (onComplete != null) {
+      _animController.addStatusListener((status) {
+        if (status == AnimationStatus.completed ||
+            status == AnimationStatus.dismissed) {
+          onComplete();
+        }
+      });
+    }
+
+    _animController
+      ..reset()
+      ..forward();
+  }
+
+  // ── Build ─────────────────────────────────────────────────────────────────
+
+  @override
+  Widget build(BuildContext context) {
+    // FIX #1: RawGestureDetector dengan _AllowMultipleScaleRecognizer
+    // menggantikan GestureDetector agar pinch memenangkan kompetisi gesture
+    // sebelum PageView sempat mencurinya.
+    return RawGestureDetector(
+      gestures: {
+        _AllowMultipleScaleRecognizer:
+            GestureRecognizerFactoryWithHandlers<_AllowMultipleScaleRecognizer>(
+              () => _AllowMultipleScaleRecognizer(debugOwner: this),
+              (instance) {
+                instance
+                  ..onStart = _onScaleStart
+                  ..onUpdate = _onScaleUpdate
+                  ..onEnd = _onScaleEnd;
+              },
+            ),
+        TapGestureRecognizer: GestureRecognizerFactoryWithHandlers<
+          TapGestureRecognizer
+        >(() => TapGestureRecognizer(debugOwner: this), (instance) {
+          instance.onTapUp = (details) => widget.onTap(details.localPosition);
+        }),
+        DoubleTapGestureRecognizer:
+            GestureRecognizerFactoryWithHandlers<DoubleTapGestureRecognizer>(
+              () => DoubleTapGestureRecognizer(debugOwner: this),
+              (instance) {
+                instance.onDoubleTapDown = _onDoubleTapDown;
+                instance.onDoubleTap = () {}; // wajib ada
+              },
+            ),
+      },
+      child: ValueListenableBuilder<Matrix4>(
+        valueListenable: widget.zoomNotifier,
+        builder:
+            (context, matrix, child) =>
+                Transform(transform: matrix, child: child),
+        child: widget.child,
       ),
     );
   }

@@ -15,7 +15,7 @@ class CodexApp extends StatelessWidget {
     const Color primaryColor = Color(0xFF4B5BAB); // Medium blueish indigo
     const Color accentColor = Color(0xFFCFFF70); // Bright lime green
     const Color surfaceColor = Color(
-      0xFF1A2142,
+      0xFF121A41,
     ); // Darker blueish indigo background
 
     return MaterialApp(
