@@ -4,6 +4,7 @@ import 'dart:ui' as ui;
 import 'dart:typed_data';
 import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/physics.dart';
 import 'package:flutter/services.dart';
 import 'package:cached_network_image/cached_network_image.dart';
 import 'package:gal/gal.dart';
@@ -12,6 +13,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 import '../models/comic.dart';
 import '../services/comic_service.dart';
 import '../services/reading_history_service.dart';
+import 'package:flutter/scheduler.dart';
 
 // ── Bookmark model ────────────────────────────────────────────────────────────
 
@@ -1490,7 +1492,7 @@ class _ZoomPage extends StatefulWidget {
 
   static const double minScale = 1.0;
   static const double maxScale = 5.0;
-  static const double doubleTapScale = 2.5;
+  static const double doubleTapScale = 1.5;
 
   const _ZoomPage({
     super.key,
@@ -1510,8 +1512,7 @@ class _ZoomPage extends StatefulWidget {
   State<_ZoomPage> createState() => _ZoomPageState();
 }
 
-class _ZoomPageState extends State<_ZoomPage>
-    with SingleTickerProviderStateMixin {
+class _ZoomPageState extends State<_ZoomPage> with TickerProviderStateMixin {
   // State gesture
   Offset _startFocalPoint = Offset.zero;
   double _startScale = 1.0;
@@ -1521,9 +1522,20 @@ class _ZoomPageState extends State<_ZoomPage>
   double _edgeAccum = 0.0;
   static const double _edgeThreshold = 55.0;
 
-  // Animasi double-tap zoom
+  // Animasi double-tap zoom / snap-back
   late AnimationController _animController;
   Animation<Matrix4>? _anim;
+
+  // Fling inertia — Ticker + FrictionSimulation terpisah per sumbu
+  Ticker? _flingTicker;
+  FrictionSimulation? _flingX;
+  FrictionSimulation? _flingY;
+  Duration? _flingStart;
+
+  // Threshold minimum kecepatan untuk memicu fling (px/s)
+  static const double _flingMinSpeed = 80.0;
+  // Koefisien gesek: semakin kecil → semakin jauh meluncur (0.0–1.0)
+  static const double _flingFriction = 0.015;
 
   bool get _isZoomed => widget.zoomNotifier.value.getMaxScaleOnAxis() > 1.05;
 
@@ -1538,6 +1550,7 @@ class _ZoomPageState extends State<_ZoomPage>
 
   @override
   void dispose() {
+    _flingTicker?.dispose();
     _animController.dispose();
     super.dispose();
   }
@@ -1577,6 +1590,8 @@ class _ZoomPageState extends State<_ZoomPage>
   // ── Gesture handlers ──────────────────────────────────────────────────────
 
   void _onScaleStart(ScaleStartDetails d) {
+    // Hentikan fling dan animasi yang sedang berjalan
+    _stopFling();
     _animController.stop();
     _startFocalPoint = d.focalPoint;
     _startMatrix = Matrix4.copy(widget.zoomNotifier.value);
@@ -1661,7 +1676,6 @@ class _ZoomPageState extends State<_ZoomPage>
 
     // Snap balik ke 1.0 kalau scale di bawah minimum
     if (widget.zoomNotifier.value.getMaxScaleOnAxis() < _ZoomPage.minScale) {
-      // FIX #3: Buka kunci setelah animasi snap-back selesai
       _animateTo(
         Matrix4.identity(),
         onComplete: () {
@@ -1693,16 +1707,90 @@ class _ZoomPageState extends State<_ZoomPage>
         else
           HapticFeedback.lightImpact();
       }
+      _edgeAccum = 0.0;
+      if (!_isZoomed) widget.pageScrollLocked.value = false;
+      return;
     }
     _edgeAccum = 0.0;
 
-    // FIX #2: Buka kunci PageView jika tidak sedang zoom
-    if (!_isZoomed) {
-      widget.pageScrollLocked.value = false;
+    // ── Fling: gunakan velocity dari ScaleEndDetails jika tersedia ──────────
+    // ScaleEndDetails.velocity lebih akurat dari estimasi per-frame di Update
+    if (_isZoomed) {
+      final Offset vel = d.velocity.pixelsPerSecond;
+      final double speed = vel.distance;
+      if (speed > _flingMinSpeed) {
+        _startFling(vel, vp);
+        return; // jangan buka kunci dulu, fling akan menjaganya
+      }
     }
+
+    if (!_isZoomed) widget.pageScrollLocked.value = false;
+  }
+
+  // ── Fling helpers ─────────────────────────────────────────────────────────
+
+  void _stopFling() {
+    _flingTicker?.stop();
+    _flingX = null;
+    _flingY = null;
+    _flingStart = null;
+  }
+
+  /// Mulai simulasi fling dengan kecepatan awal [vel] (px/s).
+  /// Dua FrictionSimulation independen untuk sumbu X dan Y.
+  void _startFling(Offset vel, Size vp) {
+    final double curTx = widget.zoomNotifier.value.getTranslation().x;
+    final double curTy = widget.zoomNotifier.value.getTranslation().y;
+
+    _flingX = FrictionSimulation(_flingFriction, curTx, vel.dx);
+    _flingY = FrictionSimulation(_flingFriction, curTy, vel.dy);
+    _flingStart = null;
+
+    _flingTicker?.dispose();
+    _flingTicker = createTicker((elapsed) {
+      _flingStart ??= elapsed;
+      final double t = (elapsed - _flingStart!).inMicroseconds / 1e6;
+
+      final double nx = _flingX!.x(t);
+      final double ny = _flingY!.x(t);
+      final double vx = _flingX!.dx(t);
+      final double vy = _flingY!.dx(t);
+
+      final double s = widget.zoomNotifier.value.getMaxScaleOnAxis();
+      widget.zoomNotifier.value = _clamped(
+        Matrix4.identity()
+          ..translate(nx, ny)
+          ..scale(s),
+        vp,
+      );
+
+      // Hentikan fling jika sudah sangat lambat atau konten sudah di batas
+      final bool stopped = vx.abs() < 1.0 && vy.abs() < 1.0;
+      final bool atEdge = _isAtAllRelevantEdges(vp, vx, vy);
+      if (stopped || atEdge) {
+        _stopFling();
+        // Kunci tetap aktif karena gambar masih di-zoom
+      }
+    });
+    _flingTicker!.start();
+  }
+
+  /// True jika gambar sudah mentok di sisi yang relevan dengan arah fling.
+  bool _isAtAllRelevantEdges(Size vp, double vx, double vy) {
+    final edges = _edges(vp);
+    final bool blockedX =
+        (vx > 0 && edges.contains('left')) ||
+        (vx < 0 && edges.contains('right')) ||
+        vx.abs() < 1.0;
+    final bool blockedY =
+        (vy > 0 && edges.contains('top')) ||
+        (vy < 0 && edges.contains('bottom')) ||
+        vy.abs() < 1.0;
+    return blockedX && blockedY;
   }
 
   void _onDoubleTapDown(TapDownDetails d) {
+    _stopFling();
     final Size vp = MediaQuery.of(context).size;
     if (_isZoomed) {
       // FIX #3: Buka kunci PageView hanya setelah animasi zoom-out selesai
