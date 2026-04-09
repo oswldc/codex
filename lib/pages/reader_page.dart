@@ -42,9 +42,6 @@ class Bookmark {
 }
 
 // ── AllowMultipleScaleRecognizer ──────────────────────────────────────────────
-//
-// Saat pointerCount >= 2 (pinch), recognizer ini langsung memenangkan
-// kompetisi gesture sehingga PageView tidak sempat mencuri swipe.
 
 class _AllowMultipleScaleRecognizer extends ScaleGestureRecognizer {
   _AllowMultipleScaleRecognizer({super.debugOwner});
@@ -55,8 +52,6 @@ class _AllowMultipleScaleRecognizer extends ScaleGestureRecognizer {
   void addAllowedPointer(PointerDownEvent event) {
     super.addAllowedPointer(event);
     _pointerCount++;
-    // Saat pointer kedua turun, langsung menangkan kompetisi gesture
-    // sehingga PageView tidak sempat mencuri swipe pinch.
     if (_pointerCount >= 2) {
       acceptGesture(event.pointer);
     }
@@ -75,10 +70,15 @@ class ReaderPage extends StatefulWidget {
   final Comic comic;
   final ReadingMode initialReadingMode;
 
+  /// Jika tidak null, dialog "Volume Selesai" akan menawarkan
+  /// untuk lanjut ke volume ini.
+  final Comic? nextVolume;
+
   const ReaderPage({
     super.key,
     required this.comic,
     this.initialReadingMode = ReadingMode.horizontal,
+    this.nextVolume,
   });
 
   @override
@@ -113,8 +113,6 @@ class _ReaderPageState extends State<ReaderPage>
   // Per-page zoom state (Matrix4 via ValueNotifier)
   final Map<int, ValueNotifier<Matrix4>> _zoomNotifiers = {};
 
-  // FIX #2: ValueNotifier<bool> untuk physics PageView agar reaktif tanpa
-  // menunggu setState parent selesai rebuild.
   final ValueNotifier<bool> _pageScrollLocked = ValueNotifier<bool>(false);
 
   // Local slider value
@@ -131,6 +129,17 @@ class _ReaderPageState extends State<ReaderPage>
 
   // Mode dual-page
   bool _dualPageMode = false;
+
+  // ── Swipe-down-to-dismiss ─────────────────────────────────────────────────
+  // Offset vertikal saat user drag ke bawah
+  final ValueNotifier<double> _dismissDragOffset = ValueNotifier<double>(0.0);
+  // Animasi snap-back saat drag dibatalkan
+  late AnimationController _dismissSnapController;
+  Animation<double>? _dismissSnapAnim;
+  static const double _dismissThreshold = 150.0;
+  static const double _dismissMaxDrag = 300.0;
+  // Guard agar dialog volume selesai tidak muncul dua kali
+  bool _volumeCompleteShown = false;
 
   bool get _isPdf => widget.comic.fileType == ComicFileType.pdf;
   bool get _isManga => _readingMode == ReadingMode.manga;
@@ -206,6 +215,12 @@ class _ReaderPageState extends State<ReaderPage>
     _isLoading = true;
     _pageController = PageController();
     _loadBookmarks();
+
+    // Animasi snap-back dismiss
+    _dismissSnapController = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 280),
+    );
 
     SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
 
@@ -360,6 +375,11 @@ class _ReaderPageState extends State<ReaderPage>
 
   void _navigateNext() {
     _resetPageZoom(_currentPage);
+    // Jika sudah di halaman terakhir → tampilkan dialog volume selesai
+    if (_currentPage >= _totalPages) {
+      _showVolumeCompleteDialog();
+      return;
+    }
     _pageController.nextPage(
       duration: const Duration(milliseconds: 200),
       curve: Curves.easeOutCubic,
@@ -372,6 +392,127 @@ class _ReaderPageState extends State<ReaderPage>
       duration: const Duration(milliseconds: 200),
       curve: Curves.easeOutCubic,
     );
+  }
+
+  // ── Volume complete dialog ────────────────────────────────────────────────
+
+  void _showVolumeCompleteDialog() {
+    if (_volumeCompleteShown) return;
+    _volumeCompleteShown = true;
+
+    HapticFeedback.mediumImpact();
+
+    showGeneralDialog(
+      context: context,
+      barrierDismissible: true,
+      barrierLabel: 'Tutup',
+      barrierColor: Colors.black54,
+      transitionDuration: const Duration(milliseconds: 350),
+      pageBuilder: (_, __, ___) => const SizedBox.shrink(),
+      transitionBuilder: (context, anim, _, __) {
+        final curved = CurvedAnimation(parent: anim, curve: Curves.easeOutBack);
+        return ScaleTransition(
+          scale: Tween<double>(begin: 0.85, end: 1.0).animate(curved),
+          child: FadeTransition(
+            opacity: anim,
+            child: _VolumeCompleteDialog(
+              comic: widget.comic,
+              nextVolume: widget.nextVolume,
+              onStay: () {
+                Navigator.pop(context);
+                // Tetap di halaman terakhir, reset guard agar bisa dibuka lagi
+                // jika user swipe balik lalu maju lagi
+                Future.delayed(
+                  const Duration(milliseconds: 400),
+                  () => _volumeCompleteShown = false,
+                );
+              },
+              onNextVolume:
+                  widget.nextVolume == null
+                      ? null
+                      : () {
+                        Navigator.pop(context); // tutup dialog
+                        // Ganti reader dengan volume berikutnya
+                        Navigator.pushReplacement(
+                          context,
+                          _FadeSlideRoute(
+                            page: ReaderPage(
+                              comic: widget.nextVolume!,
+                              initialReadingMode: _readingMode,
+                              // nextVolume berikutnya bisa di-pass dari parent
+                            ),
+                          ),
+                        );
+                      },
+            ),
+          ),
+        );
+      },
+    );
+  }
+
+  // ── Swipe-down-to-dismiss ─────────────────────────────────────────────────
+
+  /// Dipanggil dari _ZoomPage saat user drag ke bawah (tidak zoom).
+  void _onSwipeDownUpdate(double dy) {
+    // Tahan animasi snap-back jika masih berjalan
+    _dismissSnapController.stop();
+    _dismissSnapAnim = null;
+
+    // Berikan rubber-band effect: resistansi meningkat mendekati batas
+    final double clamped = dy.clamp(0.0, _dismissMaxDrag);
+    final double rubberBand =
+        clamped < _dismissMaxDrag ? clamped : _dismissMaxDrag;
+    _dismissDragOffset.value = rubberBand;
+  }
+
+  void _onSwipeDownEnd(double velocity) {
+    final double offset = _dismissDragOffset.value;
+
+    // Jika melewati threshold ATAU velocity ke bawah cukup kencang → dismiss
+    if (offset >= _dismissThreshold || velocity > 800) {
+      _executeDismiss();
+    } else {
+      // Snap kembali ke posisi awal dengan spring animation
+      _snapBackDismiss();
+    }
+  }
+
+  void _snapBackDismiss() {
+    final double from = _dismissDragOffset.value;
+    _dismissSnapController.reset();
+    _dismissSnapAnim = Tween<double>(begin: from, end: 0.0).animate(
+      CurvedAnimation(
+        parent: _dismissSnapController,
+        curve: Curves.easeOutCubic,
+      ),
+    )..addListener(() {
+      _dismissDragOffset.value = _dismissSnapAnim!.value;
+    });
+    _dismissSnapController.forward();
+  }
+
+  void _executeDismiss() {
+    // Animasikan sisa jarak ke bawah lalu pop
+    final double from = _dismissDragOffset.value;
+    _dismissSnapController.reset();
+    _dismissSnapAnim = Tween<double>(
+      begin: from,
+      end: MediaQuery.of(context).size.height,
+    ).animate(
+      CurvedAnimation(
+        parent: _dismissSnapController,
+        curve: Curves.easeInCubic,
+      ),
+    )..addListener(() {
+      _dismissDragOffset.value = _dismissSnapAnim!.value;
+    });
+    _dismissSnapController.addStatusListener((status) {
+      if (status == AnimationStatus.completed && mounted) {
+        Navigator.pop(context);
+      }
+    });
+    _dismissSnapController.forward();
   }
 
   // ── Tap navigation ────────────────────────────────────────────────────────
@@ -398,17 +539,15 @@ class _ReaderPageState extends State<ReaderPage>
     final bool goPrev = _isManga ? tapRight : tapLeft;
 
     if (goNext) {
-      if (_currentPage < _totalPages) {
-        _showTapFlash(isRight: true);
-        _navigateNext();
-      } else
-        HapticFeedback.lightImpact();
+      _showTapFlash(isRight: true);
+      _navigateNext(); // _navigateNext sudah handle halaman terakhir
     } else if (goPrev) {
       if (_currentPage > 1) {
         _showTapFlash(isRight: false);
         _navigatePrev();
-      } else
+      } else {
         HapticFeedback.lightImpact();
+      }
     }
   }
 
@@ -715,6 +854,8 @@ class _ReaderPageState extends State<ReaderPage>
     for (final n in _pdfNotifiers.values) n.dispose();
     for (final n in _zoomNotifiers.values) n.dispose();
     _pageScrollLocked.dispose();
+    _dismissDragOffset.dispose();
+    _dismissSnapController.dispose();
     _cbzNotifiers.clear();
     _pdfNotifiers.clear();
     _zoomNotifiers.clear();
@@ -738,27 +879,50 @@ class _ReaderPageState extends State<ReaderPage>
 
   @override
   Widget build(BuildContext context) {
-    return Scaffold(
-      backgroundColor: Colors.black,
-      body: Stack(
-        children: [
-          _buildReaderContent(),
-          if (_tapFlashRight != null) _buildTapZoneFlash(_tapFlashRight!),
-          AnimatedPositioned(
-            duration: const Duration(milliseconds: 300),
-            top: _showUI ? 0 : -120,
-            left: 0,
-            right: 0,
-            child: _buildTopBar(context),
+    // Wrap seluruh Scaffold dengan ValueListenableBuilder untuk animasi
+    // swipe-down-to-dismiss (translate + fade)
+    return ValueListenableBuilder<double>(
+      valueListenable: _dismissDragOffset,
+      builder: (context, dragOffset, child) {
+        // Progress: 0 = normal, 1 = fully dismissed
+        final double progress = (dragOffset / _dismissMaxDrag).clamp(0.0, 1.0);
+        final double scale = 1.0 - progress * 0.08; // menyusut sedikit
+        final double opacity = 1.0 - progress * 0.4;
+
+        return Opacity(
+          opacity: opacity.clamp(0.0, 1.0),
+          child: Transform(
+            alignment: Alignment.topCenter,
+            transform:
+                Matrix4.identity()
+                  ..translate(0.0, dragOffset)
+                  ..scale(scale),
+            child: child!,
           ),
-          AnimatedPositioned(
-            duration: const Duration(milliseconds: 300),
-            bottom: _showUI ? 0 : -180,
-            left: 0,
-            right: 0,
-            child: _buildBottomBar(context),
-          ),
-        ],
+        );
+      },
+      child: Scaffold(
+        backgroundColor: Colors.black,
+        body: Stack(
+          children: [
+            _buildReaderContent(),
+            if (_tapFlashRight != null) _buildTapZoneFlash(_tapFlashRight!),
+            AnimatedPositioned(
+              duration: const Duration(milliseconds: 300),
+              top: _showUI ? 0 : -120,
+              left: 0,
+              right: 0,
+              child: _buildTopBar(context),
+            ),
+            AnimatedPositioned(
+              duration: const Duration(milliseconds: 300),
+              bottom: _showUI ? 0 : -180,
+              left: 0,
+              right: 0,
+              child: _buildBottomBar(context),
+            ),
+          ],
+        ),
       ),
     );
   }
@@ -847,8 +1011,6 @@ class _ReaderPageState extends State<ReaderPage>
     );
   }
 
-  // FIX #2: PageView membaca physics dari ValueListenableBuilder sehingga
-  // perubahan lock/unlock terjadi secara sinkron tanpa menunggu setState parent.
   Widget _buildMainContent(Color primaryColor) {
     final bool useDual = _dualPageMode && _readingMode != ReadingMode.vertical;
     final int itemCount = useDual ? ((_totalPages + 1) ~/ 2) : _totalPages;
@@ -863,7 +1025,6 @@ class _ReaderPageState extends State<ReaderPage>
                   : Axis.horizontal,
           reverse: _isManga,
           controller: _pageController,
-          // Physics dikontrol oleh _pageScrollLocked, bukan setState parent
           physics:
               locked
                   ? const NeverScrollableScrollPhysics()
@@ -888,7 +1049,11 @@ class _ReaderPageState extends State<ReaderPage>
                           HapticFeedback.lightImpact();
                           _navigateNext();
                         }
-                        : null,
+                        : () {
+                          // Halaman terakhir: trigger dialog volume selesai
+                          HapticFeedback.mediumImpact();
+                          _showVolumeCompleteDialog();
+                        },
                 onNavigatePrev:
                     pageNumber > 1
                         ? () {
@@ -896,6 +1061,8 @@ class _ReaderPageState extends State<ReaderPage>
                           _navigatePrev();
                         }
                         : null,
+                onSwipeDownUpdate: _onSwipeDownUpdate,
+                onSwipeDownEnd: _onSwipeDownEnd,
                 child: _buildPageContent(slotIndex, primaryColor),
               );
             }
@@ -921,7 +1088,10 @@ class _ReaderPageState extends State<ReaderPage>
                         HapticFeedback.lightImpact();
                         _navigateNext();
                       }
-                      : null,
+                      : () {
+                        HapticFeedback.mediumImpact();
+                        _showVolumeCompleteDialog();
+                      },
               onNavigatePrev:
                   primaryPage > 1
                       ? () {
@@ -929,6 +1099,8 @@ class _ReaderPageState extends State<ReaderPage>
                         _navigatePrev();
                       }
                       : null,
+              onSwipeDownUpdate: _onSwipeDownUpdate,
+              onSwipeDownEnd: _onSwipeDownEnd,
               child: Row(
                 children: [
                   Expanded(
@@ -1468,14 +1640,387 @@ class _ReaderPageState extends State<ReaderPage>
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// _VolumeCompleteDialog — ditampilkan saat halaman terakhir selesai
+// ═══════════════════════════════════════════════════════════════════════════
+
+class _VolumeCompleteDialog extends StatelessWidget {
+  final Comic comic;
+  final Comic? nextVolume;
+  final VoidCallback onStay;
+  final VoidCallback? onNextVolume;
+
+  const _VolumeCompleteDialog({
+    required this.comic,
+    required this.nextVolume,
+    required this.onStay,
+    required this.onNextVolume,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final Color primaryColor = Theme.of(context).primaryColor;
+
+    return Dialog(
+      backgroundColor: Colors.transparent,
+      insetPadding: const EdgeInsets.symmetric(horizontal: 28),
+      child: ClipRRect(
+        borderRadius: BorderRadius.circular(28),
+        child: BackdropFilter(
+          filter: ui.ImageFilter.blur(sigmaX: 20, sigmaY: 20),
+          child: Container(
+            decoration: BoxDecoration(
+              color: const Color(0xFF1A1A1A).withValues(alpha: 0.92),
+              borderRadius: BorderRadius.circular(28),
+              border: Border.all(color: Colors.white.withValues(alpha: 0.1)),
+            ),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                // ── Header: ikon selesai ──────────────────────────────────
+                Container(
+                  width: double.infinity,
+                  padding: const EdgeInsets.symmetric(vertical: 28),
+                  decoration: BoxDecoration(
+                    gradient: LinearGradient(
+                      begin: Alignment.topLeft,
+                      end: Alignment.bottomRight,
+                      colors: [
+                        primaryColor.withValues(alpha: 0.3),
+                        primaryColor.withValues(alpha: 0.05),
+                      ],
+                    ),
+                  ),
+                  child: Column(
+                    children: [
+                      Container(
+                        padding: const EdgeInsets.all(16),
+                        decoration: BoxDecoration(
+                          color: primaryColor.withValues(alpha: 0.15),
+                          shape: BoxShape.circle,
+                          border: Border.all(
+                            color: primaryColor.withValues(alpha: 0.4),
+                            width: 1.5,
+                          ),
+                        ),
+                        child: Icon(
+                          Icons.auto_stories_rounded,
+                          color: primaryColor,
+                          size: 32,
+                        ),
+                      ),
+                      const SizedBox(height: 14),
+                      const Text(
+                        'Volume Selesai!',
+                        style: TextStyle(
+                          fontSize: 20,
+                          fontWeight: FontWeight.bold,
+                          color: Colors.white,
+                        ),
+                      ),
+                      const SizedBox(height: 6),
+                      Text(
+                        comic.title,
+                        style: TextStyle(
+                          fontSize: 13,
+                          color: Colors.white.withValues(alpha: 0.5),
+                        ),
+                        textAlign: TextAlign.center,
+                      ),
+                    ],
+                  ),
+                ),
+
+                // ── Next volume card (jika ada) ───────────────────────────
+                if (nextVolume != null) ...[
+                  Padding(
+                    padding: const EdgeInsets.fromLTRB(20, 20, 20, 4),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text(
+                          'Volume Berikutnya',
+                          style: TextStyle(
+                            fontSize: 11,
+                            fontWeight: FontWeight.w600,
+                            color: Colors.white.withValues(alpha: 0.4),
+                            letterSpacing: 0.8,
+                          ),
+                        ),
+                        const SizedBox(height: 10),
+                        Container(
+                          decoration: BoxDecoration(
+                            color: Colors.white.withValues(alpha: 0.05),
+                            borderRadius: BorderRadius.circular(16),
+                            border: Border.all(
+                              color: Colors.white.withValues(alpha: 0.08),
+                            ),
+                          ),
+                          child: Row(
+                            children: [
+                              // Thumbnail
+                              ClipRRect(
+                                borderRadius: const BorderRadius.horizontal(
+                                  left: Radius.circular(15),
+                                ),
+                                child: _NextVolumeThumbnail(
+                                  thumbnailPath: nextVolume!.thumbnailPath,
+                                  primaryColor: primaryColor,
+                                ),
+                              ),
+                              const SizedBox(width: 14),
+                              Expanded(
+                                child: Padding(
+                                  padding: const EdgeInsets.symmetric(
+                                    vertical: 14,
+                                  ),
+                                  child: Column(
+                                    crossAxisAlignment:
+                                        CrossAxisAlignment.start,
+                                    children: [
+                                      Text(
+                                        nextVolume!.title,
+                                        style: const TextStyle(
+                                          fontSize: 14,
+                                          fontWeight: FontWeight.bold,
+                                          color: Colors.white,
+                                        ),
+                                        maxLines: 2,
+                                        overflow: TextOverflow.ellipsis,
+                                      ),
+                                      const SizedBox(height: 4),
+                                      Text(
+                                        nextVolume!.subtitle,
+                                        style: TextStyle(
+                                          fontSize: 12,
+                                          color: Colors.white.withValues(
+                                            alpha: 0.45,
+                                          ),
+                                        ),
+                                        maxLines: 1,
+                                        overflow: TextOverflow.ellipsis,
+                                      ),
+                                      if ((nextVolume!.totalPages ?? 0) >
+                                          0) ...[
+                                        const SizedBox(height: 6),
+                                        Text(
+                                          '${nextVolume!.totalPages} halaman',
+                                          style: TextStyle(
+                                            fontSize: 11,
+                                            color: primaryColor.withValues(
+                                              alpha: 0.8,
+                                            ),
+                                          ),
+                                        ),
+                                      ],
+                                    ],
+                                  ),
+                                ),
+                              ),
+                              const SizedBox(width: 12),
+                            ],
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ] else ...[
+                  // Tidak ada volume berikutnya
+                  Padding(
+                    padding: const EdgeInsets.fromLTRB(20, 20, 20, 4),
+                    child: Container(
+                      padding: const EdgeInsets.all(16),
+                      decoration: BoxDecoration(
+                        color: Colors.white.withValues(alpha: 0.04),
+                        borderRadius: BorderRadius.circular(14),
+                      ),
+                      child: Row(
+                        children: [
+                          Icon(
+                            Icons.check_circle_outline,
+                            color: primaryColor,
+                            size: 20,
+                          ),
+                          const SizedBox(width: 12),
+                          const Expanded(
+                            child: Text(
+                              'Ini adalah volume terakhir dari seri ini.',
+                              style: TextStyle(
+                                color: Colors.white60,
+                                fontSize: 13,
+                              ),
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ),
+                ],
+
+                // ── Tombol aksi ───────────────────────────────────────────
+                Padding(
+                  padding: const EdgeInsets.fromLTRB(20, 20, 20, 24),
+                  child: Column(
+                    children: [
+                      if (nextVolume != null && onNextVolume != null)
+                        SizedBox(
+                          width: double.infinity,
+                          child: FilledButton.icon(
+                            style: FilledButton.styleFrom(
+                              backgroundColor: primaryColor,
+                              padding: const EdgeInsets.symmetric(vertical: 14),
+                              shape: RoundedRectangleBorder(
+                                borderRadius: BorderRadius.circular(14),
+                              ),
+                            ),
+                            onPressed: onNextVolume,
+                            icon: const Icon(Icons.navigate_next, size: 20),
+                            label: const Text(
+                              'Lanjut ke Volume Berikutnya',
+                              style: TextStyle(
+                                fontSize: 14,
+                                fontWeight: FontWeight.bold,
+                              ),
+                            ),
+                          ),
+                        ),
+                      if (nextVolume != null && onNextVolume != null)
+                        const SizedBox(height: 10),
+                      SizedBox(
+                        width: double.infinity,
+                        child: TextButton(
+                          style: TextButton.styleFrom(
+                            padding: const EdgeInsets.symmetric(vertical: 14),
+                            shape: RoundedRectangleBorder(
+                              borderRadius: BorderRadius.circular(14),
+                              side: BorderSide(
+                                color: Colors.white.withValues(alpha: 0.12),
+                              ),
+                            ),
+                          ),
+                          onPressed: onStay,
+                          child: Text(
+                            nextVolume != null
+                                ? 'Tetap di Sini'
+                                : 'Kembali ke Detail',
+                            style: const TextStyle(
+                              color: Colors.white70,
+                              fontSize: 14,
+                            ),
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+// ── Thumbnail widget untuk next volume ────────────────────────────────────────
+
+class _NextVolumeThumbnail extends StatelessWidget {
+  final String? thumbnailPath;
+  final Color primaryColor;
+
+  const _NextVolumeThumbnail({
+    required this.thumbnailPath,
+    required this.primaryColor,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    const double w = 72.0;
+    const double h = 100.0;
+
+    if (thumbnailPath == null || thumbnailPath!.isEmpty) {
+      return Container(
+        width: w,
+        height: h,
+        color: Colors.white.withValues(alpha: 0.05),
+        child: Icon(Icons.menu_book, color: primaryColor, size: 28),
+      );
+    }
+
+    // thumbnailPath bisa berupa path lokal atau URL
+    if (thumbnailPath!.startsWith('http')) {
+      return CachedNetworkImage(
+        imageUrl: thumbnailPath!,
+        width: w,
+        height: h,
+        fit: BoxFit.cover,
+        placeholder:
+            (_, __) => Container(
+              width: w,
+              height: h,
+              color: Colors.white.withValues(alpha: 0.05),
+              child: const Center(
+                child: CircularProgressIndicator(strokeWidth: 2),
+              ),
+            ),
+        errorWidget:
+            (_, __, ___) => Container(
+              width: w,
+              height: h,
+              color: Colors.white.withValues(alpha: 0.05),
+              child: Icon(Icons.menu_book, color: primaryColor, size: 28),
+            ),
+      );
+    }
+
+    return Image.asset(
+      thumbnailPath!,
+      width: w,
+      height: h,
+      fit: BoxFit.cover,
+      errorBuilder:
+          (_, __, ___) => Container(
+            width: w,
+            height: h,
+            color: Colors.white.withValues(alpha: 0.05),
+            child: Icon(Icons.menu_book, color: primaryColor, size: 28),
+          ),
+    );
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// _FadeSlideRoute — transisi halus antar-volume (fade + slide dari bawah)
+// ═══════════════════════════════════════════════════════════════════════════
+
+class _FadeSlideRoute extends PageRouteBuilder {
+  final Widget page;
+
+  _FadeSlideRoute({required this.page})
+    : super(
+        transitionDuration: const Duration(milliseconds: 400),
+        reverseTransitionDuration: const Duration(milliseconds: 300),
+        pageBuilder: (_, __, ___) => page,
+        transitionsBuilder: (context, animation, secondaryAnimation, child) {
+          final curved = CurvedAnimation(
+            parent: animation,
+            curve: Curves.easeOutCubic,
+          );
+          return FadeTransition(
+            opacity: curved,
+            child: SlideTransition(
+              position: Tween<Offset>(
+                begin: const Offset(0.0, 0.04),
+                end: Offset.zero,
+              ).animate(curved),
+              child: child,
+            ),
+          );
+        },
+      );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 // _ZoomPage — widget per-halaman dengan zoom & pan smooth
-//
-// FIX #1: RawGestureDetector + _AllowMultipleScaleRecognizer menggantikan
-//         GestureDetector biasa agar pinch tidak dicuri PageView.
-// FIX #2: pageScrollLocked (ValueNotifier<bool>) dikontrol di sini sehingga
-//         PageView physics berubah sinkron sebelum gesture diteruskan.
-// FIX #3: onZoomChanged dipanggil di completion callback _animateTo agar
-//         PageView tidak dibuka kunci sebelum animasi zoom-out selesai.
 // ═══════════════════════════════════════════════════════════════════════════
 
 class _ZoomPage extends StatefulWidget {
@@ -1488,6 +2033,11 @@ class _ZoomPage extends StatefulWidget {
   final void Function(Offset localPosition) onTap;
   final VoidCallback? onNavigateNext;
   final VoidCallback? onNavigatePrev;
+
+  /// Callback swipe-down-to-dismiss: dipanggil HANYA saat tidak zoom
+  final void Function(double dy) onSwipeDownUpdate;
+  final void Function(double velocity) onSwipeDownEnd;
+
   final Widget child;
 
   static const double minScale = 1.0;
@@ -1505,6 +2055,8 @@ class _ZoomPage extends StatefulWidget {
     required this.onTap,
     required this.onNavigateNext,
     required this.onNavigatePrev,
+    required this.onSwipeDownUpdate,
+    required this.onSwipeDownEnd,
     required this.child,
   });
 
@@ -1518,24 +2070,28 @@ class _ZoomPageState extends State<_ZoomPage> with TickerProviderStateMixin {
   double _startScale = 1.0;
   Matrix4 _startMatrix = Matrix4.identity();
 
-  // Akumulasi overscroll untuk navigasi halaman via edge-pan
+  // Edge-pan untuk navigasi via akumulasi overscroll
   double _edgeAccum = 0.0;
   static const double _edgeThreshold = 55.0;
+
+  // Apakah gesture saat ini diidentifikasi sebagai swipe-down
+  bool _isSwipeDownGesture = false;
 
   // Animasi double-tap zoom / snap-back
   late AnimationController _animController;
   Animation<Matrix4>? _anim;
 
-  // Fling inertia — Ticker + FrictionSimulation terpisah per sumbu
+  // Fling inertia
   Ticker? _flingTicker;
   FrictionSimulation? _flingX;
   FrictionSimulation? _flingY;
   Duration? _flingStart;
 
-  // Threshold minimum kecepatan untuk memicu fling (px/s)
   static const double _flingMinSpeed = 80.0;
-  // Koefisien gesek: semakin kecil → semakin jauh meluncur (0.0–1.0)
   static const double _flingFriction = 0.015;
+
+  // Ambang vertikal untuk membedakan swipe-down dismiss vs pan normal
+  static const double _swipeDownAngleThreshold = 55.0; // derajat
 
   bool get _isZoomed => widget.zoomNotifier.value.getMaxScaleOnAxis() > 1.05;
 
@@ -1557,7 +2113,6 @@ class _ZoomPageState extends State<_ZoomPage> with TickerProviderStateMixin {
 
   // ── Matrix helpers ────────────────────────────────────────────────────────
 
-  /// Clamp translasi agar gambar tidak keluar batas viewport.
   Matrix4 _clamped(Matrix4 m, Size vp) {
     final double s = m.getMaxScaleOnAxis();
     final double tx = m.getTranslation().x;
@@ -1569,7 +2124,6 @@ class _ZoomPageState extends State<_ZoomPage> with TickerProviderStateMixin {
       ..scale(s);
   }
 
-  /// Sisi viewport yang sedang disentuh konten.
   Set<String> _edges(Size vp) {
     final m = widget.zoomNotifier.value;
     final double s = m.getMaxScaleOnAxis();
@@ -1590,16 +2144,14 @@ class _ZoomPageState extends State<_ZoomPage> with TickerProviderStateMixin {
   // ── Gesture handlers ──────────────────────────────────────────────────────
 
   void _onScaleStart(ScaleStartDetails d) {
-    // Hentikan fling dan animasi yang sedang berjalan
     _stopFling();
     _animController.stop();
     _startFocalPoint = d.focalPoint;
     _startMatrix = Matrix4.copy(widget.zoomNotifier.value);
     _startScale = _startMatrix.getMaxScaleOnAxis();
     _edgeAccum = 0.0;
+    _isSwipeDownGesture = false;
 
-    // FIX #2: Kunci PageView segera saat gesture dimulai (jika sudah zoom
-    // atau pinch dengan 2 jari) agar drag tidak bocor ke PageView.
     if (_isZoomed || d.pointerCount >= 2) {
       widget.pageScrollLocked.value = true;
     }
@@ -1609,10 +2161,10 @@ class _ZoomPageState extends State<_ZoomPage> with TickerProviderStateMixin {
     final Size vp = MediaQuery.of(context).size;
 
     if (d.pointerCount >= 2) {
-      // FIX #1 + #2: Pastikan kunci aktif saat pinch berlangsung
+      // Pinch zoom — batalkan swipe-down jika terjadi
+      _isSwipeDownGesture = false;
       widget.pageScrollLocked.value = true;
 
-      // ── Pinch: scale dari titik focal ────────────────────────────────────
       final double newScale = (_startScale * d.scale).clamp(
         _ZoomPage.minScale,
         _ZoomPage.maxScale,
@@ -1632,41 +2184,71 @@ class _ZoomPageState extends State<_ZoomPage> with TickerProviderStateMixin {
         vp,
       );
       _edgeAccum = 0.0;
-    } else if (_isZoomed) {
-      // ── Single-finger pan (hanya aktif saat zoom > 1) ────────────────────
-      widget.pageScrollLocked.value = true;
+      return;
+    }
 
-      final double s = widget.zoomNotifier.value.getMaxScaleOnAxis();
-      final double curTx = widget.zoomNotifier.value.getTranslation().x;
-      final double curTy = widget.zoomNotifier.value.getTranslation().y;
-      widget.zoomNotifier.value = _clamped(
-        Matrix4.identity()
-          ..translate(
-            curTx + d.focalPointDelta.dx,
-            curTy + d.focalPointDelta.dy,
-          )
-          ..scale(s),
-        vp,
-      );
+    // Single-finger
+    final double dx = d.focalPointDelta.dx;
+    final double dy = d.focalPointDelta.dy;
 
-      // Akumulasi edge-pan untuk navigasi halaman
-      final edges = _edges(vp);
-      final double dx = d.focalPointDelta.dx;
-      final double dy = d.focalPointDelta.dy;
-      if (!widget.isVertical) {
-        if ((dx < 0 && edges.contains('right')) ||
-            (dx > 0 && edges.contains('left'))) {
-          _edgeAccum += dx.abs();
-        } else {
-          _edgeAccum = 0.0;
+    if (!_isZoomed) {
+      // ── Deteksi swipe-down dismiss ──────────────────────────────────────
+      // Hitung apakah gesture ini cukup vertikal ke bawah
+      final double totalDy = d.focalPoint.dy - _startFocalPoint.dy;
+      final double totalDx = d.focalPoint.dx - _startFocalPoint.dx;
+
+      if (!_isSwipeDownGesture) {
+        // Commit ke swipe-down hanya jika sudah bergerak cukup jauh
+        // dan arahnya dominan ke bawah
+        final double dist = math.sqrt(dx * dx + dy * dy);
+        if (dist > 8) {
+          final double angle =
+              math.atan2(totalDy, totalDx.abs()) * (180 / math.pi);
+          if (totalDy > 0 && angle > _swipeDownAngleThreshold) {
+            _isSwipeDownGesture = true;
+            // Kunci PageView supaya tidak slide horizontal
+            widget.pageScrollLocked.value = true;
+          }
         }
+      }
+
+      if (_isSwipeDownGesture && totalDy > 0) {
+        widget.onSwipeDownUpdate(totalDy);
+        return;
+      }
+
+      // Jika bukan swipe-down, biarkan PageView menangani
+      return;
+    }
+
+    // ── Single-finger pan saat zoom aktif ────────────────────────────────
+    widget.pageScrollLocked.value = true;
+
+    final double s = widget.zoomNotifier.value.getMaxScaleOnAxis();
+    final double curTx = widget.zoomNotifier.value.getTranslation().x;
+    final double curTy = widget.zoomNotifier.value.getTranslation().y;
+    widget.zoomNotifier.value = _clamped(
+      Matrix4.identity()
+        ..translate(curTx + dx, curTy + dy)
+        ..scale(s),
+      vp,
+    );
+
+    // Akumulasi edge-pan
+    final edges = _edges(vp);
+    if (!widget.isVertical) {
+      if ((dx < 0 && edges.contains('right')) ||
+          (dx > 0 && edges.contains('left'))) {
+        _edgeAccum += dx.abs();
       } else {
-        if ((dy < 0 && edges.contains('bottom')) ||
-            (dy > 0 && edges.contains('top'))) {
-          _edgeAccum += dy.abs();
-        } else {
-          _edgeAccum = 0.0;
-        }
+        _edgeAccum = 0.0;
+      }
+    } else {
+      if ((dy < 0 && edges.contains('bottom')) ||
+          (dy > 0 && edges.contains('top'))) {
+        _edgeAccum += dy.abs();
+      } else {
+        _edgeAccum = 0.0;
       }
     }
   }
@@ -1674,7 +2256,15 @@ class _ZoomPageState extends State<_ZoomPage> with TickerProviderStateMixin {
   void _onScaleEnd(ScaleEndDetails d) {
     final Size vp = MediaQuery.of(context).size;
 
-    // Snap balik ke 1.0 kalau scale di bawah minimum
+    // Selesaikan swipe-down
+    if (_isSwipeDownGesture) {
+      _isSwipeDownGesture = false;
+      widget.pageScrollLocked.value = false;
+      final double vy = d.velocity.pixelsPerSecond.dy;
+      widget.onSwipeDownEnd(vy);
+      return;
+    }
+
     if (widget.zoomNotifier.value.getMaxScaleOnAxis() < _ZoomPage.minScale) {
       _animateTo(
         Matrix4.identity(),
@@ -1685,7 +2275,6 @@ class _ZoomPageState extends State<_ZoomPage> with TickerProviderStateMixin {
       return;
     }
 
-    // Eksekusi navigasi via edge-pan
     if (_isZoomed && _edgeAccum >= _edgeThreshold) {
       final edges = _edges(vp);
       if (!widget.isVertical) {
@@ -1713,14 +2302,12 @@ class _ZoomPageState extends State<_ZoomPage> with TickerProviderStateMixin {
     }
     _edgeAccum = 0.0;
 
-    // ── Fling: gunakan velocity dari ScaleEndDetails jika tersedia ──────────
-    // ScaleEndDetails.velocity lebih akurat dari estimasi per-frame di Update
     if (_isZoomed) {
       final Offset vel = d.velocity.pixelsPerSecond;
       final double speed = vel.distance;
       if (speed > _flingMinSpeed) {
         _startFling(vel, vp);
-        return; // jangan buka kunci dulu, fling akan menjaganya
+        return;
       }
     }
 
@@ -1736,8 +2323,6 @@ class _ZoomPageState extends State<_ZoomPage> with TickerProviderStateMixin {
     _flingStart = null;
   }
 
-  /// Mulai simulasi fling dengan kecepatan awal [vel] (px/s).
-  /// Dua FrictionSimulation independen untuk sumbu X dan Y.
   void _startFling(Offset vel, Size vp) {
     final double curTx = widget.zoomNotifier.value.getTranslation().x;
     final double curTy = widget.zoomNotifier.value.getTranslation().y;
@@ -1750,7 +2335,6 @@ class _ZoomPageState extends State<_ZoomPage> with TickerProviderStateMixin {
     _flingTicker = createTicker((elapsed) {
       _flingStart ??= elapsed;
       final double t = (elapsed - _flingStart!).inMicroseconds / 1e6;
-
       final double nx = _flingX!.x(t);
       final double ny = _flingY!.x(t);
       final double vx = _flingX!.dx(t);
@@ -1764,18 +2348,15 @@ class _ZoomPageState extends State<_ZoomPage> with TickerProviderStateMixin {
         vp,
       );
 
-      // Hentikan fling jika sudah sangat lambat atau konten sudah di batas
       final bool stopped = vx.abs() < 1.0 && vy.abs() < 1.0;
       final bool atEdge = _isAtAllRelevantEdges(vp, vx, vy);
       if (stopped || atEdge) {
         _stopFling();
-        // Kunci tetap aktif karena gambar masih di-zoom
       }
     });
     _flingTicker!.start();
   }
 
-  /// True jika gambar sudah mentok di sisi yang relevan dengan arah fling.
   bool _isAtAllRelevantEdges(Size vp, double vx, double vy) {
     final edges = _edges(vp);
     final bool blockedX =
@@ -1793,7 +2374,6 @@ class _ZoomPageState extends State<_ZoomPage> with TickerProviderStateMixin {
     _stopFling();
     final Size vp = MediaQuery.of(context).size;
     if (_isZoomed) {
-      // FIX #3: Buka kunci PageView hanya setelah animasi zoom-out selesai
       _animateTo(
         Matrix4.identity(),
         onComplete: () {
@@ -1816,7 +2396,6 @@ class _ZoomPageState extends State<_ZoomPage> with TickerProviderStateMixin {
     }
   }
 
-  // FIX #3: _animateTo kini menerima onComplete callback opsional.
   void _animateTo(Matrix4 target, {VoidCallback? onComplete}) {
     final Matrix4 from = Matrix4.copy(widget.zoomNotifier.value);
     _animController.stop();
@@ -1826,7 +2405,6 @@ class _ZoomPageState extends State<_ZoomPage> with TickerProviderStateMixin {
       if (mounted) widget.zoomNotifier.value = _anim!.value;
     });
 
-    // Panggil onComplete tepat saat animasi selesai, bukan sebelumnya
     if (onComplete != null) {
       _animController.addStatusListener((status) {
         if (status == AnimationStatus.completed ||
@@ -1845,9 +2423,6 @@ class _ZoomPageState extends State<_ZoomPage> with TickerProviderStateMixin {
 
   @override
   Widget build(BuildContext context) {
-    // FIX #1: RawGestureDetector dengan _AllowMultipleScaleRecognizer
-    // menggantikan GestureDetector agar pinch memenangkan kompetisi gesture
-    // sebelum PageView sempat mencurinya.
     return RawGestureDetector(
       gestures: {
         _AllowMultipleScaleRecognizer:
@@ -1870,7 +2445,7 @@ class _ZoomPageState extends State<_ZoomPage> with TickerProviderStateMixin {
               () => DoubleTapGestureRecognizer(debugOwner: this),
               (instance) {
                 instance.onDoubleTapDown = _onDoubleTapDown;
-                instance.onDoubleTap = () {}; // wajib ada
+                instance.onDoubleTap = () {};
               },
             ),
       },

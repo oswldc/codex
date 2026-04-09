@@ -359,11 +359,6 @@ class _SettingPageState extends State<SettingPage> {
 
     return Scaffold(
       backgroundColor: Theme.of(context).scaffoldBackgroundColor,
-      appBar: AppBar(
-        title: const Text('Pengaturan'),
-        backgroundColor: Colors.transparent,
-        elevation: 0,
-      ),
       body: ListView(
         padding: const EdgeInsets.fromLTRB(16, 8, 16, 32),
         children: [

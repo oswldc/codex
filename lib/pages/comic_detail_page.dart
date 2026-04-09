@@ -438,8 +438,6 @@ class _ComicDetailPageState extends State<ComicDetailPage> {
                             ],
                           ),
                         ),
-
-                        const SizedBox(height: 16),
                       ],
                     ),
                   ),

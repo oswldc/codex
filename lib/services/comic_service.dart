@@ -4,6 +4,7 @@ import 'package:flutter/foundation.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:path/path.dart' as p;
 import 'package:archive/archive.dart';
+import 'package:archive/archive_io.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:path_provider/path_provider.dart';
 import '../models/comic.dart';
@@ -56,7 +57,8 @@ class ComicService {
       String? thumbnailPath;
       if (type == ComicFileType.cbz) {
         try {
-          final thumb = await compute(_extractFirstCBZPage, filePath);
+          // FIX: gunakan helper streaming, bukan readAsBytesSync
+          final thumb = await _extractFirstCBZPageSafe(filePath);
           if (thumb != null) {
             thumbnailPath = await getThumbnailPath(fileName);
             await File(thumbnailPath).writeAsBytes(thumb);
@@ -66,7 +68,6 @@ class ComicService {
         }
       } else if (type == ComicFileType.pdf) {
         try {
-          // Gunakan resolusi rendah untuk thumbnail saja
           final thumb = await _extractFirstPDFPage(
             filePath,
             thumbnailOnly: true,
@@ -256,125 +257,67 @@ class ComicService {
     }
   }
 
-  // ─── CBZ extraction ───────────────────────────────────────────────────────
+  // ─── CBZ: Streaming (memory-safe untuk file besar) ────────────────────────
+  //
+  // Perbedaan kritis vs versi lama:
+  //
+  //   LAMA — OOM untuk file besar:
+  //     ZipDecoder().decodeBytes(File(path).readAsBytesSync())
+  //     File(path).readAsBytesSync() membaca SELURUH file ke RAM sekaligus.
+  //     Untuk CBZ 3.7GB → alokasi 3.7GB di heap → OOM crash.
+  //
+  //   BARU — streaming, aman:
+  //     ZipDecoder().decodeBuffer(InputFileStream(path))
+  //     InputFileStream membaca file secara bertahap dengan buffer kecil
+  //     (default 1MB). ZipDecoder mem-parse header entry secara lazy;
+  //     isi (content) setiap entry BELUM di-decompress sampai .content
+  //     diakses secara eksplisit. Setelah dibaca, entry.clear() membebaskan
+  //     RAM-nya.
 
-  static Uint8List? _extractFirstCBZPage(String path) {
-    try {
-      final file = File(path);
-      if (!file.existsSync()) return null;
-
-      final archive = ZipDecoder().decodeBytes(file.readAsBytesSync());
-      final images =
-          archive.files.where((f) {
-              if (!f.isFile) return false;
-              final name = f.name.toLowerCase();
-              if (name.contains('__macosx') ||
-                  name.split('/').last.startsWith('.'))
-                return false;
-              return [
-                '.jpg',
-                '.png',
-                '.jpeg',
-                '.webp',
-              ].contains(p.extension(name));
-            }).toList()
-            ..sort((a, b) => a.name.compareTo(b.name));
-
-      if (images.isNotEmpty) {
-        final content = images.first.content;
-        if (content is Uint8List) return content;
-        if (content is List<int>) return Uint8List.fromList(content);
-      }
-    } catch (e) {
-      debugPrint('CBZ thumbnail error: $e');
-    }
-    return null;
-  }
-
-  static Future<List<Uint8List>> getPagesFromCBZ(String path) async {
-    return compute(_extractCBZPages, path);
-  }
-
-  static List<Uint8List> _extractCBZPages(String path) {
-    try {
-      final file = File(path);
-      if (!file.existsSync()) return [];
-
-      final archive = ZipDecoder().decodeBytes(file.readAsBytesSync());
-      final imageFiles =
-          archive.files.where((f) {
-              if (!f.isFile) return false;
-              final name = f.name.toLowerCase();
-              if (name.contains('__macosx') ||
-                  name.split('/').last.startsWith('.'))
-                return false;
-              return [
-                '.jpg',
-                '.jpeg',
-                '.png',
-                '.webp',
-              ].contains(p.extension(name));
-            }).toList()
-            ..sort((a, b) => a.name.compareTo(b.name));
-
-      return imageFiles.map((f) {
-        final content = f.content;
-        if (content is Uint8List) return content;
-        if (content is List<int>) return Uint8List.fromList(content);
-        return Uint8List(0);
-      }).toList();
-    } catch (e) {
-      debugPrint('CBZ extract error: $e');
-      return [];
-    }
-  }
-
-  // ─── CBZ lazy loading ─────────────────────────────────────────────────────
-
+  /// Cache Archive per path — dibuka via InputFileStream, bukan readAsBytesSync.
   static final Map<String, Archive> _openArchives = {};
+
+  /// Cache nama entry gambar per path — sudah difilter & diurutkan.
+  static final Map<String, List<String>> _archivePageNames = {};
 
   static Archive? _getOrOpenArchive(String path) {
     if (_openArchives.containsKey(path)) return _openArchives[path];
     try {
-      final bytes = File(path).readAsBytesSync();
-      final archive = ZipDecoder().decodeBytes(bytes);
+      final inputStream = InputFileStream(path);
+      // decodeBuffer dengan InputFileStream: parse header saja, content lazy.
+      final archive = ZipDecoder().decodeBuffer(inputStream);
       _openArchives[path] = archive;
       return archive;
     } catch (e) {
-      debugPrint('Archive open error: $e');
+      debugPrint('Archive open error ($path): $e');
       return null;
     }
   }
 
   static void closeArchive(String path) {
     _openArchives.remove(path);
+    _archivePageNames.remove(path);
+  }
+
+  static bool _isImageEntry(ArchiveFile f) {
+    if (!f.isFile) return false;
+    final name = f.name.toLowerCase();
+    if (name.contains('__macosx')) return false;
+    if (name.split('/').last.startsWith('.')) return false;
+    return ['.jpg', '.jpeg', '.png', '.webp'].contains(p.extension(name));
   }
 
   static Future<List<String>> getPagePathsFromCBZ(String path) async {
+    if (_archivePageNames.containsKey(path)) return _archivePageNames[path]!;
     final archive = _getOrOpenArchive(path);
     if (archive == null) return [];
-    return _listCBZPageNamesFromArchive(archive);
+    final names =
+        archive.files.where(_isImageEntry).map((f) => f.name).toList()..sort();
+    _archivePageNames[path] = names;
+    return names;
   }
 
-  static List<String> _listCBZPageNamesFromArchive(Archive archive) {
-    final imageEntries =
-        archive.files.where((f) {
-            if (!f.isFile) return false;
-            final name = f.name.toLowerCase();
-            if (name.contains('__macosx') ||
-                name.split('/').last.startsWith('.'))
-              return false;
-            return [
-              '.jpg',
-              '.jpeg',
-              '.png',
-              '.webp',
-            ].contains(p.extension(name));
-          }).toList()
-          ..sort((a, b) => a.name.compareTo(b.name));
-    return imageEntries.map((f) => f.name).toList();
-  }
-
+  /// Decompress satu entry on-demand, lalu bebaskan RAM-nya via clear().
   static Future<Uint8List> getPageBytes(
     String archivePath,
     String entryName,
@@ -387,31 +330,62 @@ class ComicService {
         (f) => f.name == entryName,
         orElse: () => ArchiveFile('', 0, Uint8List(0)),
       );
+      if (entry.name.isEmpty) return Uint8List(0);
+
+      // Akses .content → decompress entry ini saja (bukan semua entry)
       final content = entry.content;
+
+      // Bebaskan RAM hasil decompress setelah bytes dikembalikan ke caller
+      entry.clear();
+
       if (content is Uint8List) return content;
       if (content is List<int>) return Uint8List.fromList(content);
     } catch (e) {
-      debugPrint('CBZ page decode error ($entryName): $e');
+      debugPrint('CBZ getPageBytes error ($entryName): $e');
     }
     return Uint8List(0);
   }
 
+  static Future<List<Uint8List>> getPagesFromCBZ(String path) async {
+    final pageNames = await getPagePathsFromCBZ(path);
+    final List<Uint8List> result = [];
+    for (final name in pageNames) {
+      result.add(await getPageBytes(path, name));
+    }
+    return result;
+  }
+
+  // ─── CBZ Thumbnail (memory-safe) ─────────────────────────────────────────
+
+  /// Extract halaman pertama CBZ untuk thumbnail via streaming.
+  /// Tidak pakai cache _openArchives karena Archive thumbnail dibuka
+  /// sementara dan langsung dibuang setelah satu entry diekstrak.
+  static Future<Uint8List?> _extractFirstCBZPageSafe(String path) async {
+    try {
+      final inputStream = InputFileStream(path);
+      final archive = ZipDecoder().decodeBuffer(inputStream);
+
+      final imageEntries =
+          archive.files.where(_isImageEntry).toList()
+            ..sort((a, b) => a.name.compareTo(b.name));
+
+      if (imageEntries.isEmpty) return null;
+
+      final content = imageEntries.first.content;
+      if (content is Uint8List) return content;
+      if (content is List<int>) return Uint8List.fromList(content);
+    } catch (e) {
+      debugPrint('CBZ thumbnail safe error ($path): $e');
+    }
+    return null;
+  }
+
   // ─── PDF Document Cache ───────────────────────────────────────────────────
 
-  /// Cache PdfDocument yang sudah dibuka — key: path file PDF.
-  /// Dibuka sekali saat getPdfPageCount atau getPdfPageImage pertama kali,
-  /// dipakai ulang untuk semua halaman, ditutup saat closePdfDocument
-  /// dipanggil dari ReaderPage.dispose().
   static final Map<String, PdfDocument> _openPdfDocuments = {};
-
-  /// Cache hasil render halaman PDF — key: "$path:$pageNumber:$scale".
-  /// Halaman di luar radius ±[_pdfCacheRadius] dari halaman aktif di-evict
-  /// melalui evictPdfPageCache().
   static final Map<String, Uint8List> _pdfPageCache = {};
-
   static const int _pdfCacheRadius = 3;
 
-  /// Buka PDF (atau ambil dari cache) dan kembalikan jumlah halaman.
   static Future<int> getPdfPageCount(String path) async {
     final doc = await _getOrOpenPdfDocument(path);
     return doc?.pagesCount ?? 0;
@@ -429,11 +403,6 @@ class ComicService {
     }
   }
 
-  /// Render satu halaman PDF dengan cache.
-  ///
-  /// [pageNumber] dimulai dari 1.
-  /// [scale] adalah faktor skala render terhadap ukuran asli halaman.
-  /// Gunakan scale=1.5 untuk reader, scale=0.5 untuk thumbnail.
   static Future<Uint8List?> getPdfPageImage(
     String path,
     int pageNumber, {
@@ -469,8 +438,6 @@ class ComicService {
     }
   }
 
-  /// Pre-fetch halaman di sekitar [currentPage] secara background.
-  /// Dipanggil dari ReaderPage setelah halaman aktif selesai ditampilkan.
   static Future<void> prefetchPdfPages(
     String path,
     int currentPage,
@@ -485,13 +452,10 @@ class ComicService {
       if (i == currentPage) continue;
       final cacheKey = '$path:$i:$scale';
       if (_pdfPageCache.containsKey(cacheKey)) continue;
-      // Fire-and-forget, tidak perlu await
       getPdfPageImage(path, i, scale: scale).ignore();
     }
   }
 
-  /// Buang cache halaman yang terlalu jauh dari halaman aktif agar
-  /// memory tidak membengkak saat baca PDF panjang.
   static void evictPdfPageCache(
     String path,
     int currentPage, {
@@ -501,7 +465,6 @@ class ComicService {
         _pdfPageCache.keys.where((key) {
           if (!key.startsWith('$path:')) return false;
           final parts = key.split(':');
-          // format: "path:pageNumber:scale"
           if (parts.length < 3) return false;
           final pageNum = int.tryParse(parts[parts.length - 2]);
           if (pageNum == null) return false;
@@ -513,20 +476,14 @@ class ComicService {
     }
   }
 
-  /// Tutup PdfDocument dan bersihkan semua cache halaman untuk path ini.
-  /// Dipanggil dari ReaderPage.dispose().
   static Future<void> closePdfDocument(String path) async {
     final doc = _openPdfDocuments.remove(path);
     await doc?.close();
-
-    // Bersihkan semua cache halaman untuk dokumen ini
     _pdfPageCache.removeWhere((key, _) => key.startsWith('$path:'));
   }
 
   // ─── PDF Thumbnail (internal) ─────────────────────────────────────────────
 
-  /// Ekstrak halaman pertama PDF untuk thumbnail.
-  /// [thumbnailOnly] = true → resolusi rendah (lebar maks 400px).
   static Future<Uint8List?> _extractFirstPDFPage(
     String path, {
     bool thumbnailOnly = false,
@@ -536,15 +493,12 @@ class ComicService {
     try {
       document =
           thumbnailOnly
-              // Untuk thumbnail, buka dokumen sementara tanpa cache
               ? await PdfDocument.openFile(path)
               : await _getOrOpenPdfDocument(path);
 
       if (document == null || document.pagesCount == 0) return null;
 
       final page = await document.getPage(1);
-
-      // Untuk thumbnail: skala ke lebar maks 400px agar tidak boros memori
       final double scale =
           thumbnailOnly ? (400.0 / page.width).clamp(0.1, 1.0) : 2.0;
 
@@ -561,7 +515,6 @@ class ComicService {
       debugPrint('PDF thumbnail error: $e');
       return null;
     } finally {
-      // Tutup hanya jika dokumen ini dibuka sementara untuk thumbnail
       if (thumbnailOnly && ownDocument) {
         await document?.close();
       }
