@@ -13,6 +13,48 @@ import 'package:pdfx/pdfx.dart';
 class ComicService {
   static const String _comicsKey = 'saved_comics';
 
+  // ─── In-memory cache ──────────────────────────────────────────────────────
+
+  static List<Comic>? _cache;
+  static bool _cacheDirty = false;
+
+  static Future<List<Comic>> loadComics() async {
+    if (_cache != null) return List.unmodifiable(_cache!);
+    final prefs = await SharedPreferences.getInstance();
+    final jsonStr = prefs.getString(_comicsKey);
+    if (jsonStr == null) {
+      _cache = [];
+      return [];
+    }
+    try {
+      final List decoded = jsonDecode(jsonStr);
+      _cache = decoded.map((e) => Comic.fromJson(e)).toList();
+      return List.unmodifiable(_cache!);
+    } catch (e) {
+      debugPrint('Load error: $e');
+      _cache = [];
+      return [];
+    }
+  }
+
+  static Future<void> saveComics(List<Comic> comics) async {
+    _cache = List.of(comics);
+    _cacheDirty = false;
+    final prefs = await SharedPreferences.getInstance();
+    final data = jsonEncode(comics.map((c) => c.toJson()).toList());
+    await prefs.setString(_comicsKey, data);
+  }
+
+  static void saveNow() {
+    if (_cache == null || !_cacheDirty) return;
+    final snapshot = List.of(_cache!);
+    _cacheDirty = false;
+    SharedPreferences.getInstance().then((prefs) {
+      final data = jsonEncode(snapshot.map((c) => c.toJson()).toList());
+      prefs.setString(_comicsKey, data);
+    });
+  }
+
   // ─── Thumbnail ────────────────────────────────────────────────────────────
 
   static Future<String> getThumbnailPath(String fileName) async {
@@ -24,7 +66,13 @@ class ComicService {
 
   // ─── Pick file ────────────────────────────────────────────────────────────
 
-  static Future<List<Comic>> pickAndParseComics() async {
+  /// [onProgress] dipanggil setelah setiap file selesai diproses.
+  ///   - [current]  : indeks file yang baru saja selesai (1-based)
+  ///   - [total]    : total file yang akan diproses
+  ///   - [fileName] : nama file yang baru saja selesai
+  static Future<List<Comic>> pickAndParseComics({
+    void Function(int current, int total, String fileName)? onProgress,
+  }) async {
     FilePickerResult? result = await FilePicker.platform.pickFiles(
       allowMultiple: true,
       type: FileType.custom,
@@ -39,9 +87,19 @@ class ComicService {
     final existingIds = existing.map((c) => c.id).toSet();
     List<Comic> newComics = [];
 
-    for (var file in result.files) {
-      final filePath = file.path;
-      if (filePath == null) continue;
+    // Hitung hanya file yang belum ada (yang akan benar-benar diproses)
+    final filesToProcess =
+        result.files.where((f) {
+          if (f.path == null) return false;
+          final id = f.path!.hashCode.toRadixString(16);
+          return !existingIds.contains(id);
+        }).toList();
+
+    final total = filesToProcess.length;
+
+    for (int i = 0; i < filesToProcess.length; i++) {
+      final file = filesToProcess[i];
+      final filePath = file.path!;
 
       final fileName = p.basename(filePath);
       final ext = p.extension(fileName).toLowerCase();
@@ -49,15 +107,12 @@ class ComicService {
       final type = _detectType(ext);
       final id = filePath.hashCode.toRadixString(16);
 
-      if (existingIds.contains(id)) continue;
-
       final seriesTitle = ComicTitleParser.parseSeriesTitle(name);
       final volumeNumber = ComicTitleParser.parseVolumeNumber(name);
 
       String? thumbnailPath;
       if (type == ComicFileType.cbz) {
         try {
-          // FIX: gunakan helper streaming, bukan readAsBytesSync
           final thumb = await _extractFirstCBZPageSafe(filePath);
           if (thumb != null) {
             thumbnailPath = await getThumbnailPath(fileName);
@@ -100,33 +155,15 @@ class ComicService {
         ),
       );
       existingIds.add(id);
+
+      // Lapor progress setelah file ini selesai (1-based)
+      onProgress?.call(i + 1, total, fileName);
     }
 
     if (newComics.isNotEmpty) {
       await saveComics([...existing, ...newComics]);
     }
     return newComics;
-  }
-
-  // ─── Save & Load ──────────────────────────────────────────────────────────
-
-  static Future<void> saveComics(List<Comic> comics) async {
-    final prefs = await SharedPreferences.getInstance();
-    final data = jsonEncode(comics.map((c) => c.toJson()).toList());
-    await prefs.setString(_comicsKey, data);
-  }
-
-  static Future<List<Comic>> loadComics() async {
-    final prefs = await SharedPreferences.getInstance();
-    final jsonStr = prefs.getString(_comicsKey);
-    if (jsonStr == null) return [];
-    try {
-      final List decoded = jsonDecode(jsonStr);
-      return decoded.map((e) => Comic.fromJson(e)).toList();
-    } catch (e) {
-      debugPrint('Load error: $e');
-      return [];
-    }
   }
 
   // ─── Group by Series ──────────────────────────────────────────────────────
@@ -208,36 +245,87 @@ class ComicService {
     int? currentPage,
     int? totalPages,
   }) async {
-    final comics = await loadComics();
+    if (_cache == null) await loadComics();
+
+    final comics = _cache!;
     final index = comics.indexWhere((c) => c.id == id);
-    if (index != -1) {
-      final old = comics[index];
-      comics[index] = Comic(
-        id: old.id,
-        title: old.title,
-        subtitle: old.subtitle,
-        imageUrl: old.imageUrl,
-        coverBytes: old.coverBytes,
-        thumbnailPath: old.thumbnailPath,
-        progress: progress,
-        genre: old.genre,
-        publisher: old.publisher,
-        releaseYear: old.releaseYear,
-        writer: old.writer,
-        artist: old.artist,
-        description: old.description,
-        pages: old.pages,
-        localPath: old.localPath,
-        source: old.source,
-        fileType: old.fileType,
-        lastRead: DateTime.now().millisecondsSinceEpoch,
-        currentPage: currentPage ?? old.currentPage,
-        totalPages: totalPages ?? old.totalPages,
-        seriesTitle: old.seriesTitle,
-        volumeNumber: old.volumeNumber,
-      );
-      await saveComics(comics);
-    }
+    if (index == -1) return;
+
+    final old = comics[index];
+    final double clampedProgress = progress.clamp(0.0, 1.0);
+
+    comics[index] = Comic(
+      id: old.id,
+      title: old.title,
+      subtitle: old.subtitle,
+      imageUrl: old.imageUrl,
+      coverBytes: old.coverBytes,
+      thumbnailPath: old.thumbnailPath,
+      progress: clampedProgress,
+      genre: old.genre,
+      publisher: old.publisher,
+      releaseYear: old.releaseYear,
+      writer: old.writer,
+      artist: old.artist,
+      description: old.description,
+      pages: old.pages,
+      localPath: old.localPath,
+      source: old.source,
+      fileType: old.fileType,
+      lastRead: DateTime.now().millisecondsSinceEpoch,
+      currentPage: currentPage ?? old.currentPage,
+      totalPages: totalPages ?? old.totalPages,
+      seriesTitle: old.seriesTitle,
+      volumeNumber: old.volumeNumber,
+    );
+
+    _cacheDirty = true;
+    _flushCacheAsync();
+  }
+
+  static void _flushCacheAsync() {
+    if (_cache == null) return;
+    final snapshot = List.of(_cache!);
+    SharedPreferences.getInstance().then((prefs) {
+      final data = jsonEncode(snapshot.map((c) => c.toJson()).toList());
+      prefs.setString(_comicsKey, data).then((_) {
+        _cacheDirty = false;
+      });
+    });
+  }
+
+  // ─── Next volume helper ───────────────────────────────────────────────────
+
+  static Future<Comic?> getNextVolume(Comic comic) async {
+    if (_cache == null) await loadComics();
+
+    final sameSeriesVolumes =
+        _cache!.where((c) => c.seriesTitle == comic.seriesTitle).toList()..sort(
+          (a, b) => (a.volumeNumber ?? 999).compareTo(b.volumeNumber ?? 999),
+        );
+
+    final currentIndex = sameSeriesVolumes.indexWhere((c) => c.id == comic.id);
+
+    if (currentIndex == -1) return null;
+    if (currentIndex + 1 >= sameSeriesVolumes.length) return null;
+
+    return sameSeriesVolumes[currentIndex + 1];
+  }
+
+  static Comic? getNextVolumeSync(Comic comic) {
+    if (_cache == null) return null;
+
+    final sameSeriesVolumes =
+        _cache!.where((c) => c.seriesTitle == comic.seriesTitle).toList()..sort(
+          (a, b) => (a.volumeNumber ?? 999).compareTo(b.volumeNumber ?? 999),
+        );
+
+    final currentIndex = sameSeriesVolumes.indexWhere((c) => c.id == comic.id);
+
+    if (currentIndex == -1) return null;
+    if (currentIndex + 1 >= sameSeriesVolumes.length) return null;
+
+    return sameSeriesVolumes[currentIndex + 1];
   }
 
   // ─── Helpers ──────────────────────────────────────────────────────────────
@@ -257,34 +345,15 @@ class ComicService {
     }
   }
 
-  // ─── CBZ: Streaming (memory-safe untuk file besar) ────────────────────────
-  //
-  // Perbedaan kritis vs versi lama:
-  //
-  //   LAMA — OOM untuk file besar:
-  //     ZipDecoder().decodeBytes(File(path).readAsBytesSync())
-  //     File(path).readAsBytesSync() membaca SELURUH file ke RAM sekaligus.
-  //     Untuk CBZ 3.7GB → alokasi 3.7GB di heap → OOM crash.
-  //
-  //   BARU — streaming, aman:
-  //     ZipDecoder().decodeBuffer(InputFileStream(path))
-  //     InputFileStream membaca file secara bertahap dengan buffer kecil
-  //     (default 1MB). ZipDecoder mem-parse header entry secara lazy;
-  //     isi (content) setiap entry BELUM di-decompress sampai .content
-  //     diakses secara eksplisit. Setelah dibaca, entry.clear() membebaskan
-  //     RAM-nya.
+  // ─── CBZ: Streaming ───────────────────────────────────────────────────────
 
-  /// Cache Archive per path — dibuka via InputFileStream, bukan readAsBytesSync.
   static final Map<String, Archive> _openArchives = {};
-
-  /// Cache nama entry gambar per path — sudah difilter & diurutkan.
   static final Map<String, List<String>> _archivePageNames = {};
 
   static Archive? _getOrOpenArchive(String path) {
     if (_openArchives.containsKey(path)) return _openArchives[path];
     try {
       final inputStream = InputFileStream(path);
-      // decodeBuffer dengan InputFileStream: parse header saja, content lazy.
       final archive = ZipDecoder().decodeBuffer(inputStream);
       _openArchives[path] = archive;
       return archive;
@@ -317,7 +386,6 @@ class ComicService {
     return names;
   }
 
-  /// Decompress satu entry on-demand, lalu bebaskan RAM-nya via clear().
   static Future<Uint8List> getPageBytes(
     String archivePath,
     String entryName,
@@ -332,10 +400,7 @@ class ComicService {
       );
       if (entry.name.isEmpty) return Uint8List(0);
 
-      // Akses .content → decompress entry ini saja (bukan semua entry)
       final content = entry.content;
-
-      // Bebaskan RAM hasil decompress setelah bytes dikembalikan ke caller
       entry.clear();
 
       if (content is Uint8List) return content;
@@ -355,11 +420,8 @@ class ComicService {
     return result;
   }
 
-  // ─── CBZ Thumbnail (memory-safe) ─────────────────────────────────────────
+  // ─── CBZ Thumbnail ────────────────────────────────────────────────────────
 
-  /// Extract halaman pertama CBZ untuk thumbnail via streaming.
-  /// Tidak pakai cache _openArchives karena Archive thumbnail dibuka
-  /// sementara dan langsung dibuang setelah satu entry diekstrak.
   static Future<Uint8List?> _extractFirstCBZPageSafe(String path) async {
     try {
       final inputStream = InputFileStream(path);
@@ -482,7 +544,7 @@ class ComicService {
     _pdfPageCache.removeWhere((key, _) => key.startsWith('$path:'));
   }
 
-  // ─── PDF Thumbnail (internal) ─────────────────────────────────────────────
+  // ─── PDF Thumbnail ────────────────────────────────────────────────────────
 
   static Future<Uint8List?> _extractFirstPDFPage(
     String path, {

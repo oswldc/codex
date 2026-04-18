@@ -131,32 +131,97 @@ class _LibraryPageState extends State<LibraryPage> {
     await _loadSavedComics();
   }
 
-  // ─── Add komik ────────────────────────────────────────────────────────────
+  // ─── Add komik dengan progress dialog ────────────────────────────────────
 
   Future<void> _addLocalComics() async {
+    // State yang akan di-update lewat setState di dalam dialog
+    int _current = 0;
+    int _total = 0;
+    String _currentFile = '';
+    bool _isDone = false;
+    int _addedCount = 0;
+
+    // Kita butuh StateSetter dari dalam dialog agar bisa rebuild dialog
+    // tanpa rebuild seluruh LibraryPage.
+    StateSetter? _dialogSetState;
+
+    // Tampilkan dialog lebih dulu; import dimulai setelah dialog muncul.
+    showDialog(
+      context: context,
+      barrierDismissible: false,
+      builder: (dialogContext) {
+        return StatefulBuilder(
+          builder: (context, setDialogState) {
+            _dialogSetState = setDialogState;
+
+            return PopScope(
+              canPop: _isDone,
+              child: Dialog(
+                backgroundColor: Theme.of(context).scaffoldBackgroundColor,
+                shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(20),
+                ),
+                child: Padding(
+                  padding: const EdgeInsets.all(24),
+                  child: AnimatedSwitcher(
+                    duration: const Duration(milliseconds: 350),
+                    switchInCurve: Curves.easeOut,
+                    switchOutCurve: Curves.easeIn,
+                    child:
+                        _isDone
+                            // ── Success state ──────────────────────────────
+                            ? _ImportSuccessContent(
+                              key: const ValueKey('success'),
+                              addedCount: _addedCount,
+                            )
+                            // ── Progress state ─────────────────────────────
+                            : _ImportProgressContent(
+                              key: const ValueKey('progress'),
+                              current: _current,
+                              total: _total,
+                              currentFile: _currentFile,
+                            ),
+                  ),
+                ),
+              ),
+            );
+          },
+        );
+      },
+    );
+
+    // Mulai proses import setelah dialog terbuka
     try {
-      final newComics = await ComicService.pickAndParseComics();
+      final newComics = await ComicService.pickAndParseComics(
+        onProgress: (current, total, fileName) {
+          _dialogSetState?.call(() {
+            _current = current;
+            _total = total;
+            _currentFile = fileName;
+          });
+        },
+      );
 
       if (!mounted) return;
 
-      if (newComics.isEmpty) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(
-            content: Text('Tidak ada komik baru yang ditambahkan'),
-            backgroundColor: Colors.orange,
-          ),
-        );
-        return;
+      _addedCount = newComics.length;
+
+      // Refresh library di background sebelum transisi ke success state
+      await _fetchComics();
+
+      if (!mounted) return;
+
+      // Transisi ke success state
+      _dialogSetState?.call(() => _isDone = true);
+
+      // Tutup otomatis setelah 2 detik
+      await Future.delayed(const Duration(seconds: 2));
+      if (mounted && Navigator.of(context).canPop()) {
+        Navigator.of(context).pop();
       }
 
-      setState(() => _isLoading = true);
-      try {
-        await _fetchComics();
-      } finally {
-        if (mounted) setState(() => _isLoading = false);
-      }
-
-      if (mounted) {
+      // Tampilkan snackbar ringkasan
+      if (mounted && newComics.isNotEmpty) {
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(
             content: Text('${newComics.length} komik ditambahkan'),
@@ -167,7 +232,8 @@ class _LibraryPageState extends State<LibraryPage> {
     } catch (e) {
       debugPrint('_addLocalComics error: $e');
       if (mounted) {
-        setState(() => _isLoading = false);
+        // Tutup dialog progress jika masih terbuka
+        if (Navigator.of(context).canPop()) Navigator.of(context).pop();
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(
             content: Text('Error: $e'),
@@ -488,6 +554,143 @@ class _LibraryPageState extends State<LibraryPage> {
           onDelete: () => _deleteSeries(series),
         );
       },
+    );
+  }
+}
+
+// ─── Dialog: Progress State ───────────────────────────────────────────────────
+
+class _ImportProgressContent extends StatelessWidget {
+  final int current;
+  final int total;
+  final String currentFile;
+
+  const _ImportProgressContent({
+    super.key,
+    required this.current,
+    required this.total,
+    required this.currentFile,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final Color primaryColor = Theme.of(context).primaryColor;
+
+    // Saat total masih 0 (user belum memilih file / sedang di file picker),
+    // tampilkan spinner indeterminate.
+    final bool hasTotal = total > 0;
+    final double fraction = hasTotal ? (current / total).clamp(0.0, 1.0) : 0.0;
+    final int pct = (fraction * 100).toInt();
+
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        // Judul
+        Row(
+          children: [
+            Icon(Icons.downloading_rounded, color: primaryColor, size: 20),
+            const SizedBox(width: 8),
+            const Text(
+              'Mengimpor Komik',
+              style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
+            ),
+          ],
+        ),
+        const SizedBox(height: 20),
+
+        // Progress bar
+        ClipRRect(
+          borderRadius: BorderRadius.circular(4),
+          child: LinearProgressIndicator(
+            value: hasTotal ? fraction : null,
+            minHeight: 6,
+            backgroundColor: Colors.white12,
+            valueColor: AlwaysStoppedAnimation<Color>(primaryColor),
+          ),
+        ),
+        const SizedBox(height: 12),
+
+        // Counter + persentase
+        Row(
+          mainAxisAlignment: MainAxisAlignment.spaceBetween,
+          children: [
+            Text(
+              hasTotal ? '$current / $total file' : 'Memilih file...',
+              style: const TextStyle(fontSize: 12, color: Colors.white54),
+            ),
+            if (hasTotal)
+              Text(
+                '$pct%',
+                style: TextStyle(
+                  fontSize: 12,
+                  fontWeight: FontWeight.bold,
+                  color: primaryColor,
+                ),
+              ),
+          ],
+        ),
+        const SizedBox(height: 12),
+
+        // Nama file sedang diproses
+        if (currentFile.isNotEmpty)
+          Container(
+            width: double.infinity,
+            padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+            decoration: BoxDecoration(
+              color: Colors.white10,
+              borderRadius: BorderRadius.circular(8),
+            ),
+            child: Text(
+              currentFile,
+              style: const TextStyle(
+                fontSize: 11,
+                color: Colors.white60,
+                fontFamily: 'monospace',
+              ),
+              maxLines: 2,
+              overflow: TextOverflow.ellipsis,
+            ),
+          ),
+
+        const SizedBox(height: 4),
+      ],
+    );
+  }
+}
+
+// ─── Dialog: Success State ────────────────────────────────────────────────────
+
+class _ImportSuccessContent extends StatelessWidget {
+  final int addedCount;
+
+  const _ImportSuccessContent({super.key, required this.addedCount});
+
+  @override
+  Widget build(BuildContext context) {
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        const SizedBox(height: 8),
+        const Icon(
+          Icons.check_circle_rounded,
+          color: Colors.greenAccent,
+          size: 52,
+        ),
+        const SizedBox(height: 16),
+        Text(
+          addedCount > 0 ? 'Import Selesai!' : 'Tidak Ada Komik Baru',
+          style: const TextStyle(fontSize: 17, fontWeight: FontWeight.bold),
+        ),
+        const SizedBox(height: 6),
+        Text(
+          addedCount > 0
+              ? '$addedCount komik berhasil ditambahkan'
+              : 'Semua file yang dipilih sudah ada di library',
+          style: const TextStyle(fontSize: 13, color: Colors.white54),
+          textAlign: TextAlign.center,
+        ),
+        const SizedBox(height: 8),
+      ],
     );
   }
 }

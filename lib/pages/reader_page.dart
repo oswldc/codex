@@ -1,4 +1,5 @@
 import 'dart:convert';
+import 'dart:io' as dart_io;
 import 'dart:math' as math;
 import 'dart:ui' as ui;
 import 'dart:typed_data';
@@ -71,7 +72,7 @@ class ReaderPage extends StatefulWidget {
   final ReadingMode initialReadingMode;
 
   /// Jika tidak null, dialog "Volume Selesai" akan menawarkan
-  /// untuk lanjut ke volume ini.
+  /// untuk lanjut ke volume ini. Jika null, akan di-resolve otomatis.
   final Comic? nextVolume;
 
   const ReaderPage({
@@ -92,6 +93,10 @@ class _ReaderPageState extends State<ReaderPage>
   bool _showUI = true;
   int _currentPage = 1;
   int _totalPages = -1;
+
+  // FIX BUG 2: nextVolume di-resolve secara otomatis di initState
+  // sehingga tidak bergantung pada pemanggil yang meng-pass parameter.
+  Comic? _resolvedNextVolume;
 
   // For CBZ/CBR: lazy per-page cache via ValueNotifier
   List<String> _localPagePaths = [];
@@ -131,14 +136,11 @@ class _ReaderPageState extends State<ReaderPage>
   bool _dualPageMode = false;
 
   // ── Swipe-down-to-dismiss ─────────────────────────────────────────────────
-  // Offset vertikal saat user drag ke bawah
   final ValueNotifier<double> _dismissDragOffset = ValueNotifier<double>(0.0);
-  // Animasi snap-back saat drag dibatalkan
   late AnimationController _dismissSnapController;
   Animation<double>? _dismissSnapAnim;
   static const double _dismissThreshold = 150.0;
   static const double _dismissMaxDrag = 300.0;
-  // Guard agar dialog volume selesai tidak muncul dua kali
   bool _volumeCompleteShown = false;
 
   bool get _isPdf => widget.comic.fileType == ComicFileType.pdf;
@@ -216,7 +218,6 @@ class _ReaderPageState extends State<ReaderPage>
     _pageController = PageController();
     _loadBookmarks();
 
-    // Animasi snap-back dismiss
     _dismissSnapController = AnimationController(
       vsync: this,
       duration: const Duration(milliseconds: 280),
@@ -250,6 +251,12 @@ class _ReaderPageState extends State<ReaderPage>
           total = widget.comic.pages.length;
         }
 
+        // FIX BUG 2: Resolve nextVolume otomatis.
+        // Prioritaskan yang di-pass dari luar (misal saat navigasi antar volume),
+        // fallback ke lookup dari ComicService.
+        final Comic? resolved =
+            widget.nextVolume ?? await ComicService.getNextVolume(widget.comic);
+
         if (total > 0) {
           int targetPage = (initialProgress * total).round().clamp(1, total);
           if ((widget.comic.currentPage ?? 0) > 0) {
@@ -264,6 +271,7 @@ class _ReaderPageState extends State<ReaderPage>
               _totalPages = total;
               _currentPage = targetPage;
               _isLoading = false;
+              _resolvedNextVolume = resolved;
             });
           }
 
@@ -274,6 +282,7 @@ class _ReaderPageState extends State<ReaderPage>
             setState(() {
               _totalPages = 0;
               _isLoading = false;
+              _resolvedNextVolume = resolved;
             });
         }
       } catch (e) {
@@ -375,7 +384,6 @@ class _ReaderPageState extends State<ReaderPage>
 
   void _navigateNext() {
     _resetPageZoom(_currentPage);
-    // Jika sudah di halaman terakhir → tampilkan dialog volume selesai
     if (_currentPage >= _totalPages) {
       _showVolumeCompleteDialog();
       return;
@@ -417,29 +425,32 @@ class _ReaderPageState extends State<ReaderPage>
             opacity: anim,
             child: _VolumeCompleteDialog(
               comic: widget.comic,
-              nextVolume: widget.nextVolume,
+              // FIX BUG 2: gunakan _resolvedNextVolume, bukan widget.nextVolume
+              nextVolume: _resolvedNextVolume,
               onStay: () {
-                Navigator.pop(context);
-                // Tetap di halaman terakhir, reset guard agar bisa dibuka lagi
-                // jika user swipe balik lalu maju lagi
+                Navigator.pop(context); // tutup dialog
+                // Reset guard agar bisa dibuka lagi jika user swipe balik
                 Future.delayed(
                   const Duration(milliseconds: 400),
                   () => _volumeCompleteShown = false,
                 );
               },
+              // FIX BUG 1: "Kembali ke Detail" — pop dialog lalu pop ReaderPage
+              onBack: () {
+                Navigator.pop(context); // tutup dialog
+                Navigator.pop(context); // kembali ke detail page
+              },
               onNextVolume:
-                  widget.nextVolume == null
+                  _resolvedNextVolume == null
                       ? null
                       : () {
                         Navigator.pop(context); // tutup dialog
-                        // Ganti reader dengan volume berikutnya
                         Navigator.pushReplacement(
                           context,
                           _FadeSlideRoute(
                             page: ReaderPage(
-                              comic: widget.nextVolume!,
+                              comic: _resolvedNextVolume!,
                               initialReadingMode: _readingMode,
-                              // nextVolume berikutnya bisa di-pass dari parent
                             ),
                           ),
                         );
@@ -453,27 +464,20 @@ class _ReaderPageState extends State<ReaderPage>
 
   // ── Swipe-down-to-dismiss ─────────────────────────────────────────────────
 
-  /// Dipanggil dari _ZoomPage saat user drag ke bawah (tidak zoom).
   void _onSwipeDownUpdate(double dy) {
-    // Tahan animasi snap-back jika masih berjalan
     _dismissSnapController.stop();
     _dismissSnapAnim = null;
 
-    // Berikan rubber-band effect: resistansi meningkat mendekati batas
     final double clamped = dy.clamp(0.0, _dismissMaxDrag);
-    final double rubberBand =
-        clamped < _dismissMaxDrag ? clamped : _dismissMaxDrag;
-    _dismissDragOffset.value = rubberBand;
+    _dismissDragOffset.value = clamped;
   }
 
   void _onSwipeDownEnd(double velocity) {
     final double offset = _dismissDragOffset.value;
 
-    // Jika melewati threshold ATAU velocity ke bawah cukup kencang → dismiss
     if (offset >= _dismissThreshold || velocity > 800) {
       _executeDismiss();
     } else {
-      // Snap kembali ke posisi awal dengan spring animation
       _snapBackDismiss();
     }
   }
@@ -493,7 +497,6 @@ class _ReaderPageState extends State<ReaderPage>
   }
 
   void _executeDismiss() {
-    // Animasikan sisa jarak ke bawah lalu pop
     final double from = _dismissDragOffset.value;
     _dismissSnapController.reset();
     _dismissSnapAnim = Tween<double>(
@@ -540,7 +543,7 @@ class _ReaderPageState extends State<ReaderPage>
 
     if (goNext) {
       _showTapFlash(isRight: true);
-      _navigateNext(); // _navigateNext sudah handle halaman terakhir
+      _navigateNext();
     } else if (goPrev) {
       if (_currentPage > 1) {
         _showTapFlash(isRight: false);
@@ -818,13 +821,19 @@ class _ReaderPageState extends State<ReaderPage>
   }
 
   void _saveProgress(int page, {bool force = false}) {
-    final now = DateTime.now();
-    if (!force &&
-        _lastSaved != null &&
-        now.difference(_lastSaved!).inSeconds < 2)
-      return;
-    _lastSaved = now;
-    final double progress = _totalPages > 0 ? (page / _totalPages) : 0.0;
+    final bool isLastPage = _totalPages > 0 && page >= _totalPages;
+    if (!force && !isLastPage) {
+      final now = DateTime.now();
+      if (_lastSaved != null && now.difference(_lastSaved!).inSeconds < 2)
+        return;
+      _lastSaved = now;
+    }
+
+    final double progress =
+        _totalPages > 0
+            ? (isLastPage ? 1.0 : (page / _totalPages).clamp(0.0, 1.0))
+            : 0.0;
+
     ComicService.updateComicProgress(
       widget.comic.id,
       progress,
@@ -846,7 +855,20 @@ class _ReaderPageState extends State<ReaderPage>
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
-    _saveProgress(_currentPage, force: true);
+
+    if (_totalPages > 0) {
+      final bool isLastPage = _currentPage >= _totalPages;
+      final double finalProgress =
+          isLastPage ? 1.0 : (_currentPage / _totalPages).clamp(0.0, 1.0);
+      ComicService.updateComicProgress(
+        widget.comic.id,
+        finalProgress,
+        currentPage: _currentPage,
+        totalPages: _totalPages,
+      );
+    }
+    ComicService.saveNow();
+
     SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
     if (widget.comic.localPath != null)
       ComicService.closeArchive(widget.comic.localPath!);
@@ -879,14 +901,11 @@ class _ReaderPageState extends State<ReaderPage>
 
   @override
   Widget build(BuildContext context) {
-    // Wrap seluruh Scaffold dengan ValueListenableBuilder untuk animasi
-    // swipe-down-to-dismiss (translate + fade)
     return ValueListenableBuilder<double>(
       valueListenable: _dismissDragOffset,
       builder: (context, dragOffset, child) {
-        // Progress: 0 = normal, 1 = fully dismissed
         final double progress = (dragOffset / _dismissMaxDrag).clamp(0.0, 1.0);
-        final double scale = 1.0 - progress * 0.08; // menyusut sedikit
+        final double scale = 1.0 - progress * 0.08;
         final double opacity = 1.0 - progress * 0.4;
 
         return Opacity(
@@ -1050,7 +1069,6 @@ class _ReaderPageState extends State<ReaderPage>
                           _navigateNext();
                         }
                         : () {
-                          // Halaman terakhir: trigger dialog volume selesai
                           HapticFeedback.mediumImpact();
                           _showVolumeCompleteDialog();
                         },
@@ -1640,19 +1658,24 @@ class _ReaderPageState extends State<ReaderPage>
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// _VolumeCompleteDialog — ditampilkan saat halaman terakhir selesai
+// _VolumeCompleteDialog
 // ═══════════════════════════════════════════════════════════════════════════
 
 class _VolumeCompleteDialog extends StatelessWidget {
   final Comic comic;
   final Comic? nextVolume;
   final VoidCallback onStay;
+
+  /// FIX BUG 1: Callback terpisah untuk "Kembali ke Detail"
+  /// (pop dialog + pop ReaderPage), berbeda dari onStay (hanya pop dialog).
+  final VoidCallback onBack;
   final VoidCallback? onNextVolume;
 
   const _VolumeCompleteDialog({
     required this.comic,
     required this.nextVolume,
     required this.onStay,
+    required this.onBack,
     required this.onNextVolume,
   });
 
@@ -1676,7 +1699,7 @@ class _VolumeCompleteDialog extends StatelessWidget {
             child: Column(
               mainAxisSize: MainAxisSize.min,
               children: [
-                // ── Header: ikon selesai ──────────────────────────────────
+                // ── Header ────────────────────────────────────────────────
                 Container(
                   width: double.infinity,
                   padding: const EdgeInsets.symmetric(vertical: 28),
@@ -1757,7 +1780,6 @@ class _VolumeCompleteDialog extends StatelessWidget {
                           ),
                           child: Row(
                             children: [
-                              // Thumbnail
                               ClipRRect(
                                 borderRadius: const BorderRadius.horizontal(
                                   left: Radius.circular(15),
@@ -1824,7 +1846,6 @@ class _VolumeCompleteDialog extends StatelessWidget {
                     ),
                   ),
                 ] else ...[
-                  // Tidak ada volume berikutnya
                   Padding(
                     padding: const EdgeInsets.fromLTRB(20, 20, 20, 4),
                     child: Container(
@@ -1861,7 +1882,8 @@ class _VolumeCompleteDialog extends StatelessWidget {
                   padding: const EdgeInsets.fromLTRB(20, 20, 20, 24),
                   child: Column(
                     children: [
-                      if (nextVolume != null && onNextVolume != null)
+                      // Tombol lanjut ke volume berikutnya (hanya jika ada)
+                      if (nextVolume != null && onNextVolume != null) ...[
                         SizedBox(
                           width: double.infinity,
                           child: FilledButton.icon(
@@ -1883,8 +1905,34 @@ class _VolumeCompleteDialog extends StatelessWidget {
                             ),
                           ),
                         ),
-                      if (nextVolume != null && onNextVolume != null)
                         const SizedBox(height: 10),
+                        // Tetap di sini — hanya ada saat ada volume berikutnya
+                        SizedBox(
+                          width: double.infinity,
+                          child: TextButton(
+                            style: TextButton.styleFrom(
+                              padding: const EdgeInsets.symmetric(vertical: 14),
+                              shape: RoundedRectangleBorder(
+                                borderRadius: BorderRadius.circular(14),
+                                side: BorderSide(
+                                  color: Colors.white.withValues(alpha: 0.12),
+                                ),
+                              ),
+                            ),
+                            onPressed: onStay,
+                            child: const Text(
+                              'Tetap di Sini',
+                              style: TextStyle(
+                                color: Colors.white70,
+                                fontSize: 14,
+                              ),
+                            ),
+                          ),
+                        ),
+                        const SizedBox(height: 8),
+                      ],
+                      // FIX BUG 1: "Kembali ke Detail" selalu tampil,
+                      // memanggil onBack yang melakukan double-pop.
                       SizedBox(
                         width: double.infinity,
                         child: TextButton(
@@ -1893,17 +1941,15 @@ class _VolumeCompleteDialog extends StatelessWidget {
                             shape: RoundedRectangleBorder(
                               borderRadius: BorderRadius.circular(14),
                               side: BorderSide(
-                                color: Colors.white.withValues(alpha: 0.12),
+                                color: Colors.white.withValues(alpha: 0.08),
                               ),
                             ),
                           ),
-                          onPressed: onStay,
-                          child: Text(
-                            nextVolume != null
-                                ? 'Tetap di Sini'
-                                : 'Kembali ke Detail',
-                            style: const TextStyle(
-                              color: Colors.white70,
+                          onPressed: onBack,
+                          child: const Text(
+                            'Kembali ke Detail',
+                            style: TextStyle(
+                              color: Colors.white54,
                               fontSize: 14,
                             ),
                           ),
@@ -1937,17 +1983,14 @@ class _NextVolumeThumbnail extends StatelessWidget {
     const double w = 72.0;
     const double h = 100.0;
 
+    // Placeholder saat path kosong
     if (thumbnailPath == null || thumbnailPath!.isEmpty) {
-      return Container(
-        width: w,
-        height: h,
-        color: Colors.white.withValues(alpha: 0.05),
-        child: Icon(Icons.menu_book, color: primaryColor, size: 28),
-      );
+      return _placeholder(w, h);
     }
 
-    // thumbnailPath bisa berupa path lokal atau URL
-    if (thumbnailPath!.startsWith('http')) {
+    // URL jaringan
+    if (thumbnailPath!.startsWith('http://') ||
+        thumbnailPath!.startsWith('https://')) {
       return CachedNetworkImage(
         imageUrl: thumbnailPath!,
         width: w,
@@ -1962,34 +2005,45 @@ class _NextVolumeThumbnail extends StatelessWidget {
                 child: CircularProgressIndicator(strokeWidth: 2),
               ),
             ),
-        errorWidget:
-            (_, __, ___) => Container(
-              width: w,
-              height: h,
-              color: Colors.white.withValues(alpha: 0.05),
-              child: Icon(Icons.menu_book, color: primaryColor, size: 28),
-            ),
+        errorWidget: (_, __, ___) => _placeholder(w, h),
       );
     }
 
+    // FIX BUG 3: Path lokal absolut (thumbnailPath dari getApplicationDocumentsDirectory)
+    // Deteksi: mulai dengan '/' (absolute path di Android/iOS)
+    // atau tidak mengandung skema (bukan asset, bukan URL).
+    if (thumbnailPath!.startsWith('/')) {
+      return Image.file(
+        dart_io.File(thumbnailPath!),
+        width: w,
+        height: h,
+        fit: BoxFit.cover,
+        errorBuilder: (_, __, ___) => _placeholder(w, h),
+      );
+    }
+
+    // Asset bundled (fallback)
     return Image.asset(
       thumbnailPath!,
       width: w,
       height: h,
       fit: BoxFit.cover,
-      errorBuilder:
-          (_, __, ___) => Container(
-            width: w,
-            height: h,
-            color: Colors.white.withValues(alpha: 0.05),
-            child: Icon(Icons.menu_book, color: primaryColor, size: 28),
-          ),
+      errorBuilder: (_, __, ___) => _placeholder(w, h),
+    );
+  }
+
+  Widget _placeholder(double w, double h) {
+    return Container(
+      width: w,
+      height: h,
+      color: Colors.white.withValues(alpha: 0.05),
+      child: Icon(Icons.menu_book, color: primaryColor, size: 28),
     );
   }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// _FadeSlideRoute — transisi halus antar-volume (fade + slide dari bawah)
+// _FadeSlideRoute
 // ═══════════════════════════════════════════════════════════════════════════
 
 class _FadeSlideRoute extends PageRouteBuilder {
@@ -2020,7 +2074,7 @@ class _FadeSlideRoute extends PageRouteBuilder {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// _ZoomPage — widget per-halaman dengan zoom & pan smooth
+// _ZoomPage
 // ═══════════════════════════════════════════════════════════════════════════
 
 class _ZoomPage extends StatefulWidget {
@@ -2033,11 +2087,8 @@ class _ZoomPage extends StatefulWidget {
   final void Function(Offset localPosition) onTap;
   final VoidCallback? onNavigateNext;
   final VoidCallback? onNavigatePrev;
-
-  /// Callback swipe-down-to-dismiss: dipanggil HANYA saat tidak zoom
   final void Function(double dy) onSwipeDownUpdate;
   final void Function(double velocity) onSwipeDownEnd;
-
   final Widget child;
 
   static const double minScale = 1.0;
@@ -2065,23 +2116,18 @@ class _ZoomPage extends StatefulWidget {
 }
 
 class _ZoomPageState extends State<_ZoomPage> with TickerProviderStateMixin {
-  // State gesture
   Offset _startFocalPoint = Offset.zero;
   double _startScale = 1.0;
   Matrix4 _startMatrix = Matrix4.identity();
 
-  // Edge-pan untuk navigasi via akumulasi overscroll
   double _edgeAccum = 0.0;
   static const double _edgeThreshold = 55.0;
 
-  // Apakah gesture saat ini diidentifikasi sebagai swipe-down
   bool _isSwipeDownGesture = false;
 
-  // Animasi double-tap zoom / snap-back
   late AnimationController _animController;
   Animation<Matrix4>? _anim;
 
-  // Fling inertia
   Ticker? _flingTicker;
   FrictionSimulation? _flingX;
   FrictionSimulation? _flingY;
@@ -2089,9 +2135,7 @@ class _ZoomPageState extends State<_ZoomPage> with TickerProviderStateMixin {
 
   static const double _flingMinSpeed = 80.0;
   static const double _flingFriction = 0.015;
-
-  // Ambang vertikal untuk membedakan swipe-down dismiss vs pan normal
-  static const double _swipeDownAngleThreshold = 55.0; // derajat
+  static const double _swipeDownAngleThreshold = 55.0;
 
   bool get _isZoomed => widget.zoomNotifier.value.getMaxScaleOnAxis() > 1.05;
 
@@ -2110,8 +2154,6 @@ class _ZoomPageState extends State<_ZoomPage> with TickerProviderStateMixin {
     _animController.dispose();
     super.dispose();
   }
-
-  // ── Matrix helpers ────────────────────────────────────────────────────────
 
   Matrix4 _clamped(Matrix4 m, Size vp) {
     final double s = m.getMaxScaleOnAxis();
@@ -2141,8 +2183,6 @@ class _ZoomPageState extends State<_ZoomPage> with TickerProviderStateMixin {
     };
   }
 
-  // ── Gesture handlers ──────────────────────────────────────────────────────
-
   void _onScaleStart(ScaleStartDetails d) {
     _stopFling();
     _animController.stop();
@@ -2161,7 +2201,6 @@ class _ZoomPageState extends State<_ZoomPage> with TickerProviderStateMixin {
     final Size vp = MediaQuery.of(context).size;
 
     if (d.pointerCount >= 2) {
-      // Pinch zoom — batalkan swipe-down jika terjadi
       _isSwipeDownGesture = false;
       widget.pageScrollLocked.value = true;
 
@@ -2187,26 +2226,20 @@ class _ZoomPageState extends State<_ZoomPage> with TickerProviderStateMixin {
       return;
     }
 
-    // Single-finger
     final double dx = d.focalPointDelta.dx;
     final double dy = d.focalPointDelta.dy;
 
     if (!_isZoomed) {
-      // ── Deteksi swipe-down dismiss ──────────────────────────────────────
-      // Hitung apakah gesture ini cukup vertikal ke bawah
       final double totalDy = d.focalPoint.dy - _startFocalPoint.dy;
       final double totalDx = d.focalPoint.dx - _startFocalPoint.dx;
 
       if (!_isSwipeDownGesture) {
-        // Commit ke swipe-down hanya jika sudah bergerak cukup jauh
-        // dan arahnya dominan ke bawah
         final double dist = math.sqrt(dx * dx + dy * dy);
         if (dist > 8) {
           final double angle =
               math.atan2(totalDy, totalDx.abs()) * (180 / math.pi);
           if (totalDy > 0 && angle > _swipeDownAngleThreshold) {
             _isSwipeDownGesture = true;
-            // Kunci PageView supaya tidak slide horizontal
             widget.pageScrollLocked.value = true;
           }
         }
@@ -2217,11 +2250,9 @@ class _ZoomPageState extends State<_ZoomPage> with TickerProviderStateMixin {
         return;
       }
 
-      // Jika bukan swipe-down, biarkan PageView menangani
       return;
     }
 
-    // ── Single-finger pan saat zoom aktif ────────────────────────────────
     widget.pageScrollLocked.value = true;
 
     final double s = widget.zoomNotifier.value.getMaxScaleOnAxis();
@@ -2234,7 +2265,6 @@ class _ZoomPageState extends State<_ZoomPage> with TickerProviderStateMixin {
       vp,
     );
 
-    // Akumulasi edge-pan
     final edges = _edges(vp);
     if (!widget.isVertical) {
       if ((dx < 0 && edges.contains('right')) ||
@@ -2256,7 +2286,6 @@ class _ZoomPageState extends State<_ZoomPage> with TickerProviderStateMixin {
   void _onScaleEnd(ScaleEndDetails d) {
     final Size vp = MediaQuery.of(context).size;
 
-    // Selesaikan swipe-down
     if (_isSwipeDownGesture) {
       _isSwipeDownGesture = false;
       widget.pageScrollLocked.value = false;
@@ -2313,8 +2342,6 @@ class _ZoomPageState extends State<_ZoomPage> with TickerProviderStateMixin {
 
     if (!_isZoomed) widget.pageScrollLocked.value = false;
   }
-
-  // ── Fling helpers ─────────────────────────────────────────────────────────
 
   void _stopFling() {
     _flingTicker?.stop();
@@ -2418,8 +2445,6 @@ class _ZoomPageState extends State<_ZoomPage> with TickerProviderStateMixin {
       ..reset()
       ..forward();
   }
-
-  // ── Build ─────────────────────────────────────────────────────────────────
 
   @override
   Widget build(BuildContext context) {
